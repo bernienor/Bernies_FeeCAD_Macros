@@ -34,6 +34,13 @@ along their own curving path via ordinary y_position/z_offset values.
 Run this from the FreeCAD Macro menu (or the Macro toolbar) - it needs the
 GUI, since it shows a dialog for picking the station file and options.
 
+### Demo files for WingBuilder
+
+The folder WingBuilderDemo contains a numer of csv files showing the use and 
+potentional of the macro. The files uses airfoils that are available online.
+I.E. ag455ct-02.dat.
+
+
 ## WingMouldMacro.FCMacro
 
 Macro to make mould of wings. It is not as generic as one would hope. Works 

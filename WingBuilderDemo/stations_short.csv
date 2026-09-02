@@ -1,0 +1,5 @@
+dat_file,y_position,chord,x_offset, z_offset, twist_deg, bend
+ag455ct-02r.dat, 0.0, 180.0, 0.0, 0.0, 0.0, 0.0
+ag46ct-02r.dat, 50.0, 140.0, 0.0, 0.0, 0.0, 0.0
+ag47ct-02r.dat, 75.0, 80.0, 0.0, 0.0, 0.0, 0.0
+

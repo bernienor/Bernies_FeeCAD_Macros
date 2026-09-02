@@ -1,0 +1,5 @@
+dat_file,y_position,chord,x_offset, z_offset, twist_deg, bend
+# NanoFloh wing test
+ag455ct-02r.dat, 0.0, 145.0, 0.0, 0.0, 0.0, 0.0
+ag47ct-02r.dat, 400.0, 80.0, 25.0, 0.0, 0.0, 0.0
+
