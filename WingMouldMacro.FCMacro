@@ -1,0 +1,1445 @@
+# -*- coding: utf-8 -*-
+"""
+Wing Mould Generator - FreeCAD Macro
+--------------------------------------------------
+Builds a two-part mould around an existing wing solid, driven by a
+settings dialog.
+
+STAGE 1: enclosure block built from the wing's bounding box, expanded by
+six independent extension distances (X+/X-/Y+/Y-/Z+/Z-). All zero
+reproduces the bounding box exactly. Boolean-cut the wing out of that
+block -> mould blank with a wing-shaped cavity.
+
+STAGE 2: GUI dialog (PySide) to set/load/save settings and trigger builds.
+
+STAGE 3 (this version): splits the mould blank into two halves along the
+wing's natural parting line, defined for a vertical (Z) pull direction as
+follows -- at each span station, the parting points are the two points on
+that cross-section's outline that are extremal along the chordwise axis
+(furthest forward / furthest aft). Those are exactly the points where a
+straight vertical pull can no longer release the surface without locking.
+The parting *line* along the span is built from these points at many
+stations; the parting *surface* used to actually cut the blank continues
+that line's height flat out to the edges of the mould block (fore/aft of
+the airfoil, and past the root/tip), so it fully crosses the block.
+
+STAGE 4: added a simple flat-plane parting option as a fallback next to
+the contour-following one (kept, but parked for now -- see notes below).
+Default is Z = 0.0 exactly, not auto-centered on the wing's bounding box:
+for an untwisted wing whose sections were built with LE and TE on the
+Z=0 plane (WingBuilder's convention), the exact flat parting height is
+Z=0, not the bounding-box midpoint. The midpoint drifts away from the
+true LE/TE line by the airfoil's camber, which is usually small but
+non-zero -- and near the trailing edge, where the section pinches down
+to near-zero thickness, even a small drift is enough for the flat plane
+to miss the wing surface entirely on one side, leaving a thin unsplit
+sliver of material along the TE in one of the two halves. If a wing ever
+isn't built with LE/TE at Z=0 (or has twist), use "Auto-center on wing"
+or the manual Z field to match wherever it actually sits, or switch to
+the contour-following knife once that's revisited.
+
+Assumptions worth checking against your wing geometry:
+  - Pull/vertical axis is fixed at global Z.
+  - Flat parting plane defaults to exact Z=0 (see STAGE 4 note above).
+  - Span axis defaults to Y (configurable to X in the dialog).
+  - The straight-line interpolation between the two parting points at
+    each station is assumed to stay inside the (now-empty) wing cavity.
+    This holds for ordinary airfoils; a very reflexed/cambered section
+    could in principle violate it. Worth a visual check the first time
+    you run this on a new wing.
+
+NOT YET IMPLEMENTED (planned for later passes):
+  - Alignment pins/keys, pour spouts, vents, registration features.
+  - Draft angle allowances beyond straight vertical pull.
+
+USAGE:
+  1. Select the wing solid, run the macro.
+  2. "Build Mould Blank" first.
+  3. "Split Into Mould Halves" second -- produces MouldTop and
+     MouldBottom, plus MouldPartingSurface (the cutting surface itself,
+     kept around for visual inspection).
+"""
+
+import FreeCAD as App
+import FreeCADGui as Gui
+import Part
+import json
+import os
+import csv
+import math
+
+try:
+    from PySide2 import QtWidgets
+except ImportError:
+    from PySide6 import QtWidgets
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+SETTINGS_PATH = os.path.join(os.path.expanduser("~"), ".freecad", "wing_mould_settings.json")
+TARGET_OBJECT_NAME = "Wing"
+OUTPUT_PREFIX = "Mould"
+TOP_POINT_TESSELLATION_DEVIATION = 0.1
+
+# Number of points used when discretizing each cross-section wire to find
+# its chordwise-extremal points.
+STATION_DISCRETIZE_POINTS = 200
+
+DEFAULT_SETTINGS = {
+    "enclosure": {
+        "min_dist_x_pos": 20.0,
+        "min_dist_x_neg": 20.0,
+        "min_dist_y_pos": 20.0,
+        "min_dist_y_neg": 20.0,
+        "min_dist_z_pos": 20.0,
+        "min_dist_z_neg": 20.0,
+        "non_rectangular": False,
+        "station_csv_path": "",
+    },
+    "parting": {
+        "span_axis": "Y",
+        "num_sections": 80,
+        "use_flat_plane": True,
+        "flat_plane_auto": False,
+        "flat_plane_z": 0.0,
+    },
+    "holes": [],
+    "tabs": {
+        "width": 5.0,
+        "depth": 4.0,
+        "height": 2.0,
+        "count": 0,
+    },
+}
+
+ENCLOSURE_FIELDS = [
+    ("min_dist_x_pos", "X+"),
+    ("min_dist_x_neg", "X-"),
+    ("min_dist_y_pos", "Y+"),
+    ("min_dist_y_neg", "Y-"),
+    ("min_dist_z_pos", "Z+"),
+    ("min_dist_z_neg", "Z-"),
+]
+
+PARTING_AXIS_OPTIONS = ["X", "Y"]
+AXIS_INDEX = {"X": 0, "Y": 1}  # Z (index 2) is fixed as the vertical/pull axis.
+
+
+# ---------------------------------------------------------------------------
+# Settings load / save
+# ---------------------------------------------------------------------------
+
+def load_settings(path=SETTINGS_PATH):
+    """Load settings from a JSON file. Missing keys are backfilled from
+    DEFAULT_SETTINGS so older settings files stay usable as new setting
+    groups get added in later stages."""
+    settings = json.loads(json.dumps(DEFAULT_SETTINGS))  # deep copy
+
+    if os.path.isfile(path):
+        try:
+            with open(path, "r") as f:
+                loaded = json.load(f)
+            for group, values in loaded.items():
+                if isinstance(values, dict):
+                    if group not in settings or not isinstance(settings.get(group), dict):
+                        settings[group] = {}
+                    settings[group].update(values)
+                else:
+                    # Non-dict groups (e.g. "holes", a list) are replaced
+                    # wholesale rather than merged key-by-key.
+                    settings[group] = values
+            App.Console.PrintMessage("Wing mould: loaded settings from {}\n".format(path))
+        except Exception as e:
+            App.Console.PrintWarning(
+                "Wing mould: could not read settings file ({}), using defaults.\n".format(e)
+            )
+    else:
+        App.Console.PrintMessage(
+            "Wing mould: no settings file found at {}, using defaults.\n".format(path)
+        )
+
+    return settings
+
+
+def save_settings(settings, path=SETTINGS_PATH):
+    """Write settings out to a JSON file, creating parent folders as needed."""
+    folder = os.path.dirname(path)
+    if folder and not os.path.isdir(folder):
+        os.makedirs(folder)
+    with open(path, "w") as f:
+        json.dump(settings, f, indent=2)
+    App.Console.PrintMessage("Wing mould: settings saved to {}\n".format(path))
+
+
+# ---------------------------------------------------------------------------
+# Generic axis helpers
+# ---------------------------------------------------------------------------
+
+def axis_vector(index):
+    """Unit vector along the given axis index (0=X, 1=Y, 2=Z)."""
+    coords = [0.0, 0.0, 0.0]
+    coords[index] = 1.0
+    return App.Vector(*coords)
+
+
+def vec_component(v, index):
+    """Read component `index` (0=X, 1=Y, 2=Z) off an App.Vector without
+    relying on Vector supporting [] indexing (not guaranteed across
+    FreeCAD versions)."""
+    if index == 0:
+        return v.x
+    elif index == 1:
+        return v.y
+    else:
+        return v.z
+
+
+def make_point(span_index, chord_index, span_val, chord_val, z_val):
+    """Build a point given explicit values for the span axis, the chord
+    axis, and Z -- regardless of which of X/Y is span vs. chord."""
+    coords = [0.0, 0.0, 0.0]
+    coords[span_index] = span_val
+    coords[chord_index] = chord_val
+    coords[2] = z_val
+    return App.Vector(*coords)
+
+
+def make_axis_box(span_index, chord_index, span_lo, span_hi, chord_lo, chord_hi, z_lo, z_hi):
+    """Build a box spanning [span_lo, span_hi] along the span axis,
+    [chord_lo, chord_hi] along the chord axis, and [z_lo, z_hi] along Z --
+    regardless of which of X/Y is span vs. chord. Unlike Part.makeBox
+    (always X/Y/Z length order), this lets callers work purely in
+    span/chord/Z terms."""
+    base = make_point(span_index, chord_index, span_lo, chord_lo, z_lo)
+    lengths = [0.0, 0.0, 0.0]
+    lengths[span_index] = span_hi - span_lo
+    lengths[chord_index] = chord_hi - chord_lo
+    lengths[2] = z_hi - z_lo
+    return Part.makeBox(lengths[0], lengths[1], lengths[2], base)
+
+
+# ---------------------------------------------------------------------------
+# Geometry helpers
+# ---------------------------------------------------------------------------
+
+def get_target_solid():
+    """Return the document object the mould should be built around.
+
+    Preference order:
+      1. The currently Gui-selected object, if it has a solid shape.
+      2. The document object named/labelled TARGET_OBJECT_NAME.
+    """
+    doc = App.ActiveDocument
+    if doc is None:
+        raise RuntimeError("No active FreeCAD document.")
+
+    sel = Gui.Selection.getSelection()
+    if sel:
+        obj = sel[0]
+        if hasattr(obj, "Shape") and obj.Shape.Solids:
+            return obj
+        else:
+            App.Console.PrintWarning(
+                "Wing mould: selected object '{}' has no solid shape, "
+                "falling back to TARGET_OBJECT_NAME.\n".format(obj.Label)
+            )
+
+    obj = doc.getObject(TARGET_OBJECT_NAME)
+    if obj is None:
+        matches = [o for o in doc.Objects if o.Label == TARGET_OBJECT_NAME]
+        obj = matches[0] if matches else None
+
+    if obj is None or not hasattr(obj, "Shape") or not obj.Shape.Solids:
+        raise RuntimeError(
+            "Could not find a solid to build a mould for. Select it in the "
+            "Gui, or set TARGET_OBJECT_NAME to match its name/label."
+        )
+    return obj
+
+
+def get_top_point(shape, deviation=TOP_POINT_TESSELLATION_DEVIATION):
+    """Find the point on the shape's surface with the greatest Z value.
+
+    Not used by the enclosure or parting-line logic below -- kept as a
+    general-purpose helper (real surface point via tessellation, X/Y
+    included, rather than just the bounding box's Z extent).
+    """
+    vertices, _facets = shape.tessellate(deviation)
+    if not vertices:
+        bb = shape.BoundBox
+        return App.Vector(bb.Center.x, bb.Center.y, bb.ZMax)
+
+    top = max(vertices, key=lambda v: v[2])
+    return App.Vector(top[0], top[1], top[2])
+
+
+def compute_enclosure_bounds(shape, enclosure_settings):
+    """Compute (xmin, xmax, ymin, ymax, zmin, zmax) for the mould block.
+
+    Each bound is the wing's own bounding box, extended by the matching
+    setting. All six values at 0 reproduces the bounding box exactly.
+    """
+    bb = shape.BoundBox
+    s = enclosure_settings
+
+    xmin = bb.XMin - s["min_dist_x_neg"]
+    xmax = bb.XMax + s["min_dist_x_pos"]
+    ymin = bb.YMin - s["min_dist_y_neg"]
+    ymax = bb.YMax + s["min_dist_y_pos"]
+    zmin = bb.ZMin - s["min_dist_z_neg"]
+    zmax = bb.ZMax + s["min_dist_z_pos"]
+
+    return xmin, xmax, ymin, ymax, zmin, zmax
+
+
+def make_enclosure_box(bounds):
+    """Build a box shape spanning the given bounds."""
+    xmin, xmax, ymin, ymax, zmin, zmax = bounds
+    length = xmax - xmin
+    width = ymax - ymin
+    height = zmax - zmin
+    return Part.makeBox(length, width, height, App.Vector(xmin, ymin, zmin))
+
+
+def margin_pair_for_axis(axis_index, enclosure_settings):
+    """Return (negative_margin, positive_margin) for a given axis index
+    (0=X, 1=Y) from the enclosure settings dict."""
+    if axis_index == 0:
+        return enclosure_settings["min_dist_x_neg"], enclosure_settings["min_dist_x_pos"]
+    else:
+        return enclosure_settings["min_dist_y_neg"], enclosure_settings["min_dist_y_pos"]
+
+
+def read_station_csv(path):
+    """Parse a WingBuilder-style station CSV: dat_file, y_position, chord,
+    x_offset, z_offset, twist_deg, bend_deg -- the last four optional,
+    default 0. Header row is optional, detected the same way WingBuilder
+    does: if row 1's 2nd/3rd fields don't parse as numbers, row 1 is a
+    header and its cell text becomes the column names; otherwise the
+    default column order above is assumed. Blank lines and lines whose
+    first cell starts with '#' are skipped. Returns a list of dicts,
+    sorted by y_position ascending (root first, tip last)."""
+    default_columns = ["dat_file", "y_position", "chord", "x_offset", "z_offset", "twist_deg", "bend_deg"]
+
+    with open(path, "r", newline="") as f:
+        raw_rows = list(csv.reader(f))
+
+    rows = []
+    for raw_row in raw_rows:
+        cells = [c.strip().strip('"') for c in raw_row]
+        if not cells or not cells[0] or cells[0].startswith("#"):
+            continue
+        rows.append(cells)
+
+    if not rows:
+        raise RuntimeError("Station CSV has no data rows.")
+
+    def parses_as_float(s):
+        try:
+            float(s)
+            return True
+        except ValueError:
+            return False
+
+    first = rows[0]
+    header_present = not (len(first) > 2 and parses_as_float(first[1]) and parses_as_float(first[2]))
+    if header_present:
+        columns = first
+        data_rows = rows[1:]
+    else:
+        columns = default_columns
+        data_rows = rows
+
+    def get_float(row, name, default=0.0):
+        val = row.get(name, "")
+        if val == "" or val is None:
+            return default
+        try:
+            return float(val)
+        except ValueError:
+            return default
+
+    stations = []
+    for cells in data_rows:
+        row = {}
+        for i, col_name in enumerate(columns):
+            if i < len(cells):
+                row[col_name] = cells[i]
+        stations.append({
+            "dat_file": row.get("dat_file", ""),
+            "y_position": get_float(row, "y_position"),
+            "chord": get_float(row, "chord"),
+            "x_offset": get_float(row, "x_offset", 0.0),
+            "z_offset": get_float(row, "z_offset", 0.0),
+            "twist_deg": get_float(row, "twist_deg", 0.0),
+            "bend_deg": get_float(row, "bend_deg", 0.0),
+        })
+
+    if len(stations) < 2:
+        raise RuntimeError("Station CSV needs at least 2 stations (found {}).".format(len(stations)))
+
+    stations.sort(key=lambda s: s["y_position"])
+    return stations
+
+
+def station_le_te_local(station):
+    """Local (WingBuilder frame: X=chord, Y=span, Z=thickness) leading and
+    trailing edge points for a station dict, accounting for twist_deg
+    (rotation about the station's own leading edge, about the Y axis).
+    bend_deg (winglet reorientation) is not accounted for -- see the
+    warning in build_wing_outline_face_from_csv."""
+    le = App.Vector(station["x_offset"], station["y_position"], station["z_offset"])
+    twist_rad = math.radians(station.get("twist_deg", 0.0))
+    te_rel_x = station["chord"] * math.cos(twist_rad)
+    te_rel_z = -station["chord"] * math.sin(twist_rad)
+    te = App.Vector(
+        station["x_offset"] + te_rel_x,
+        station["y_position"],
+        station["z_offset"] + te_rel_z,
+    )
+    return le, te
+
+
+def build_wing_outline_face_from_csv(target, span_index, enclosure_settings, z_base, csv_path):
+    """Build the 4-point trapezoid outline face using root/tip corners read
+    directly from a WingBuilder station CSV, rather than slicing the
+    solid. Pure arithmetic on the CSV's own numbers, so it isn't subject
+    to the fragility of slicing near a thin or curved tip.
+
+    Note: WingBuilder's rounded tip cap is deliberately extra geometry
+    added beyond these station positions, by its own design -- so this
+    still gives the pre-cap corners, not a cap-aware outline. The tip-
+    side margin still needs to cover the cap, same as before; this just
+    makes the corners themselves reliable.
+    """
+    stations = read_station_csv(csv_path)
+    root = stations[0]
+    tip = stations[-1]
+
+    for station, label in ((root, "root"), (tip, "tip")):
+        if abs(station.get("bend_deg", 0.0)) > 0.5:
+            App.Console.PrintWarning(
+                "Wing mould: {} station has bend_deg={:.1f} -- CSV-based "
+                "corner extraction doesn't account for bent (winglet) "
+                "stations and may be inaccurate there.\n".format(label, station["bend_deg"])
+            )
+
+    root_le_local, root_te_local = station_le_te_local(root)
+    tip_le_local, tip_te_local = station_le_te_local(tip)
+
+    placement = target.Placement
+    root_le = placement.multVec(root_le_local)
+    root_te = placement.multVec(root_te_local)
+    tip_le = placement.multVec(tip_le_local)
+    tip_te = placement.multVec(tip_te_local)
+
+    chord_index = 1 - span_index
+    chord_neg, chord_pos = margin_pair_for_axis(chord_index, enclosure_settings)
+    span_neg, span_pos = margin_pair_for_axis(span_index, enclosure_settings)
+
+    root_y = vec_component(root_le, span_index)
+    tip_y = vec_component(tip_le, span_index)
+    root_span = root_y - span_neg
+    tip_span = tip_y + span_pos
+
+    root_chord_lo = vec_component(root_le, chord_index) - chord_neg
+    root_chord_hi = vec_component(root_te, chord_index) + chord_pos
+    tip_chord_lo = vec_component(tip_le, chord_index) - chord_neg
+    tip_chord_hi = vec_component(tip_te, chord_index) + chord_pos
+
+    p1 = make_point(span_index, chord_index, root_span, root_chord_lo, z_base)
+    p2 = make_point(span_index, chord_index, root_span, root_chord_hi, z_base)
+    p3 = make_point(span_index, chord_index, tip_span, tip_chord_hi, z_base)
+    p4 = make_point(span_index, chord_index, tip_span, tip_chord_lo, z_base)
+
+    wire = Part.makePolygon([p1, p2, p3, p4, p1])
+    face = Part.Face(wire)
+
+    corner_data = {
+        "root_y": root_y,
+        "tip_y": tip_y,
+        "root_lo": root_chord_lo,
+        "root_hi": root_chord_hi,
+        "tip_lo": tip_chord_lo,
+        "tip_hi": tip_chord_hi,
+    }
+    return face, corner_data
+
+
+def build_wing_outline_face(shape, span_index, enclosure_settings, z_base):
+    """Build a simple 4-point (trapezoidal) outline face at Z=z_base, from
+    just the wing's root and tip cross-sections, expanded by the
+    chordwise enclosure margins (X+/X- or Y+/Y-, whichever axis is
+    chordwise) and extended past root/tip by the spanwise margins.
+
+    This deliberately does not trace every station along the span --
+    tracing many stations followed the wing closely everywhere, but the
+    cross-sections shrinking down near the tip could produce a visible
+    artifact there (a small jog/notch) once the end-cap was stitched on.
+    A straight-edge trapezoid through root and tip only is exact for a
+    linearly-tapered (and/or swept) panel, and far more robust. It is
+    only an approximation for a wing with a curved planform, local kinks,
+    or an irregular tip -- for those, widen the enclosure margins so the
+    straight edges still fully enclose the actual surface.
+    """
+    chord_index = 1 - span_index
+    stations, _ = compute_parting_stations(shape, span_index, 2)
+    if len(stations) < 2:
+        raise RuntimeError("Could not find root/tip cross-sections to trace a wing outline.")
+
+    chord_neg, chord_pos = margin_pair_for_axis(chord_index, enclosure_settings)
+    span_neg, span_pos = margin_pair_for_axis(span_index, enclosure_settings)
+
+    root_span, root_min, root_max = stations[0]
+    tip_span, tip_min, tip_max = stations[-1]
+
+    span_lo = root_span - span_neg
+    span_hi = tip_span + span_pos
+
+    root_chord_lo = vec_component(root_min, chord_index) - chord_neg
+    root_chord_hi = vec_component(root_max, chord_index) + chord_pos
+    tip_chord_lo = vec_component(tip_min, chord_index) - chord_neg
+    tip_chord_hi = vec_component(tip_max, chord_index) + chord_pos
+
+    p1 = make_point(span_index, chord_index, span_lo, root_chord_lo, z_base)
+    p2 = make_point(span_index, chord_index, span_lo, root_chord_hi, z_base)
+    p3 = make_point(span_index, chord_index, span_hi, tip_chord_hi, z_base)
+    p4 = make_point(span_index, chord_index, span_hi, tip_chord_lo, z_base)
+
+    wire = Part.makePolygon([p1, p2, p3, p4, p1])
+    face = Part.Face(wire)
+
+    corner_data = {
+        "root_y": root_span,
+        "tip_y": tip_span,
+        "root_lo": root_chord_lo,
+        "root_hi": root_chord_hi,
+        "tip_lo": tip_chord_lo,
+        "tip_hi": tip_chord_hi,
+    }
+    return face, corner_data
+
+
+def compute_enclosure_shape(shape, enclosure_settings, parting_settings, target=None):
+    """Build the enclosure solid -- a plain box by default, or (when
+    enclosure_settings['non_rectangular'] is set) a 4-sided trapezoidal
+    prism following the wing's root/tip outline. If a station CSV path is
+    set and readable, its numbers are used for the corners (robust, no
+    solid geometry queries); otherwise falls back to slicing the solid
+    itself. Returns (shape, bounds, corner_data): bounds is always the
+    overall (xmin, xmax, ymin, ymax, zmin, zmax) axis-aligned box, used
+    elsewhere (holes, flat parting plane) regardless of enclosure shape;
+    corner_data is the root/tip span/chord corner dict used to build the
+    trapezoid (None in rectangular mode), reused by separation tabs so
+    their edge placement always matches whichever wall is actually there.
+    """
+    bounds = compute_enclosure_bounds(shape, enclosure_settings)
+
+    if not enclosure_settings.get("non_rectangular", False):
+        return make_enclosure_box(bounds), bounds, None
+
+    if parting_settings is None:
+        raise RuntimeError(
+            "Non-rectangular mould needs the span axis from the Parting "
+            "line settings, but none were supplied."
+        )
+    span_index = AXIS_INDEX[parting_settings["span_axis"]]
+    xmin, xmax, ymin, ymax, zmin, zmax = bounds
+
+    csv_path = (enclosure_settings.get("station_csv_path") or "").strip()
+    outline_face = None
+    corner_data = None
+
+    if csv_path:
+        if not os.path.isfile(csv_path):
+            App.Console.PrintWarning(
+                "Wing mould: station CSV '{}' not found -- falling back to "
+                "tracing the outline from the solid.\n".format(csv_path)
+            )
+        elif target is None:
+            App.Console.PrintWarning(
+                "Wing mould: no target object available for station CSV "
+                "placement -- falling back to tracing the outline from "
+                "the solid.\n"
+            )
+        else:
+            try:
+                outline_face, corner_data = build_wing_outline_face_from_csv(
+                    target, span_index, enclosure_settings, zmin, csv_path
+                )
+                App.Console.PrintMessage(
+                    "Wing mould: non-rectangular outline built from station "
+                    "CSV '{}'\n".format(csv_path)
+                )
+            except Exception as e:
+                App.Console.PrintWarning(
+                    "Wing mould: could not use station CSV ({}) -- falling "
+                    "back to tracing the outline from the solid.\n".format(e)
+                )
+
+    if outline_face is None:
+        outline_face, corner_data = build_wing_outline_face(shape, span_index, enclosure_settings, zmin)
+
+    enclosure_shape = outline_face.extrude(App.Vector(0, 0, zmax - zmin))
+    return enclosure_shape, bounds, corner_data
+
+
+def build_holes_cutter(holes, enclosure_bounds):
+    """Build a single fused solid of vertical (Z-axis) cylinders, one per
+    hole entry (dicts with 'x', 'y', 'diameter'), each spanning well past
+    the full Z height of the enclosure -- so they cleanly perforate the
+    mould blank (and later, both halves once split)."""
+    if not holes:
+        return None
+    xmin, xmax, ymin, ymax, zmin, zmax = enclosure_bounds
+    margin = 5.0
+    height = (zmax - zmin) + 2 * margin
+    base_z = zmin - margin
+
+    cylinders = []
+    for hole in holes:
+        diameter = float(hole.get("diameter", 6.0))
+        radius = max(diameter / 2.0, 0.01)
+        x = float(hole.get("x", 0.0))
+        y = float(hole.get("y", 0.0))
+        cyl = Part.makeCylinder(radius, height, App.Vector(x, y, base_z), App.Vector(0, 0, 1))
+        cylinders.append(cyl)
+
+    return combine_shapes(cylinders)
+
+
+def compute_flat_plane_z(wing_shape, parting_settings):
+    """Return the Z height used by the flat XY parting plane -- either
+    auto-centered on the wing's own bounding-box mid-height, or the
+    manually configured value. Shared by the actual split (build_mould_halves)
+    and by separation-tab placement, so tabs always land exactly on
+    whatever Z the split itself uses. (Assumes the flat-plane split method
+    -- the parked contour-following split doesn't have a single parting Z
+    to share.)
+    """
+    if bool(parting_settings.get("flat_plane_auto", False)):
+        wing_bb = wing_shape.BoundBox
+        return (wing_bb.ZMin + wing_bb.ZMax) / 2.0
+    return float(parting_settings.get("flat_plane_z", 0.0))
+
+
+def build_tabs_cutter(shape, bounds, enclosure_settings, parting_settings, tabs_settings, corner_data, parting_z):
+    """Build a fused solid of small box cutters for separation tabs --
+    rectangular notches straddling the parting line on both long edges of
+    the mould, spaced across the wing's real span (root to tip, not
+    counting the enclosure's spanwise extension margins) by dividing the
+    span into N equal segments and centering one tab in each segment --
+    i.e. tab i (0-indexed) sits at fraction (2i+1)/(2N) of the span. For
+    N=2 that's 1/4 and 3/4. Returns None if tabs_settings['count'] is 0.
+
+    Works in either enclosure mode: for the rectangular case, both edges
+    are just the constant xmin/xmax (or ymin/ymax); for the non-rectangular
+    case, edge position is linearly interpolated between the same root/tip
+    corner_data used to build the trapezoid outline itself, so tabs always
+    line up with whichever wall is actually there.
+    """
+    count = int(tabs_settings.get("count", 0))
+    if count <= 0:
+        return None
+
+    width = float(tabs_settings.get("width", 5.0))
+    depth = float(tabs_settings.get("depth", 4.0))
+    height = float(tabs_settings.get("height", 2.0))
+
+    span_index = AXIS_INDEX[parting_settings["span_axis"]]
+    chord_index = 1 - span_index
+    xmin, xmax, ymin, ymax, zmin, zmax = bounds
+
+    real_root, real_tip = get_span_bounds(shape, span_index)
+    span_range = real_tip - real_root
+    if span_range <= 0:
+        raise RuntimeError("Wing solid has zero extent along the span axis.")
+    positions = [real_root + span_range * (2 * i + 1) / (2.0 * count) for i in range(count)]
+
+    non_rect = bool(enclosure_settings.get("non_rectangular", False)) and corner_data is not None
+    chord_lo_const, chord_hi_const = (xmin, xmax) if chord_index == 0 else (ymin, ymax)
+
+    def edge_at(y, side):
+        if non_rect:
+            root_y = corner_data["root_y"]
+            tip_y = corner_data["tip_y"]
+            root_val = corner_data["root_lo"] if side == "lo" else corner_data["root_hi"]
+            tip_val = corner_data["tip_lo"] if side == "lo" else corner_data["tip_hi"]
+            if tip_y == root_y:
+                return root_val
+            t = (y - root_y) / (tip_y - root_y)
+            return root_val + t * (tip_val - root_val)
+        return chord_lo_const if side == "lo" else chord_hi_const
+
+    chord_neg, chord_pos = margin_pair_for_axis(chord_index, enclosure_settings)
+    if depth > chord_neg or depth > chord_pos:
+        App.Console.PrintWarning(
+            "Wing mould: separation tab depth ({:.2f} mm) exceeds the "
+            "enclosure margin on at least one edge ({:.2f} / {:.2f} mm) -- "
+            "tabs may cut through into the cavity.\n".format(depth, chord_neg, chord_pos)
+        )
+
+    protrude = 2.0  # extend past the nominal edge for a clean through-cut
+    z_lo = parting_z - height / 2.0
+    z_hi = parting_z + height / 2.0
+
+    cutters = []
+    for y in positions:
+        span_lo = y - width / 2.0
+        span_hi = y + width / 2.0
+
+        lo_edge = edge_at(y, "lo")
+        cutters.append(make_axis_box(
+            span_index, chord_index, span_lo, span_hi,
+            lo_edge - protrude, lo_edge + depth, z_lo, z_hi
+        ))
+
+        hi_edge = edge_at(y, "hi")
+        cutters.append(make_axis_box(
+            span_index, chord_index, span_lo, span_hi,
+            hi_edge - depth, hi_edge + protrude, z_lo, z_hi
+        ))
+
+    return combine_shapes(cutters)
+
+
+def build_mould_blank(enclosure_settings, holes_settings=None, parting_settings=None, tabs_settings=None):
+    """Build (or rebuild) the mould blank object using the given enclosure
+    settings dict (keys as in DEFAULT_SETTINGS['enclosure']), then cut any
+    alignment holes (list of {'x','y','diameter'} dicts) and separation
+    tabs out of it too.
+
+    parting_settings is required whenever enclosure_settings['non_rectangular']
+    is set (supplies the span axis used to find the wing's root and tip)
+    and whenever tabs_settings['count'] > 0 (supplies the span axis for
+    tab spacing, and the parting Z for tab centering)."""
+    doc = App.ActiveDocument
+    if doc is None:
+        raise RuntimeError("No active FreeCAD document.")
+
+    target = get_target_solid()
+    shape = target.Shape
+
+    try:
+        enclosure_shape, bounds, corner_data = compute_enclosure_shape(
+            shape, enclosure_settings, parting_settings, target
+        )
+    except Exception as e:
+        raise RuntimeError("Failed to build the enclosure: {}".format(e))
+
+    mould_blank_shape = enclosure_shape.cut(shape)
+
+    if holes_settings:
+        holes_cutter = build_holes_cutter(holes_settings, bounds)
+        if holes_cutter is not None:
+            try:
+                mould_blank_shape = mould_blank_shape.cut(holes_cutter)
+            except Exception as e:
+                raise RuntimeError("Failed to cut alignment holes: {}".format(e))
+
+    if tabs_settings and int(tabs_settings.get("count", 0)) > 0:
+        if parting_settings is None:
+            raise RuntimeError(
+                "Separation tabs need the Parting line settings (span "
+                "axis), but none were supplied."
+            )
+        parting_z = compute_flat_plane_z(shape, parting_settings)
+        try:
+            tabs_cutter = build_tabs_cutter(
+                shape, bounds, enclosure_settings, parting_settings, tabs_settings, corner_data, parting_z
+            )
+        except Exception as e:
+            raise RuntimeError("Failed to build separation tabs: {}".format(e))
+        if tabs_cutter is not None:
+            try:
+                mould_blank_shape = mould_blank_shape.cut(tabs_cutter)
+            except Exception as e:
+                raise RuntimeError("Failed to cut separation tabs: {}".format(e))
+
+    name = OUTPUT_PREFIX + "Blank"
+    existing = doc.getObject(name)
+    if existing is not None:
+        doc.removeObject(existing.Name)
+
+    mould_blank = doc.addObject("Part::Feature", name)
+    mould_blank.Shape = mould_blank_shape
+    mould_blank.Label = name
+
+    doc.recompute()
+    return mould_blank
+
+
+# ---------------------------------------------------------------------------
+# Parting line / parting surface
+# ---------------------------------------------------------------------------
+
+def get_span_bounds(shape, span_index):
+    bb = shape.BoundBox
+    return (bb.XMin, bb.XMax) if span_index == 0 else (bb.YMin, bb.YMax)
+
+
+def compute_parting_stations(shape, span_index, num_sections):
+    """Sample the wing solid at a series of span stations. At each station,
+    slice the solid and find the two points on the resulting outline that
+    are extremal along the chordwise axis -- the natural parting points
+    for a vertical (Z) pull direction.
+
+    Returns (stations, chord_index) where stations is a list of
+    (span_value, point_min_chord, point_max_chord).
+    """
+    if not hasattr(shape, "slice"):
+        raise RuntimeError(
+            "This FreeCAD's Part.Shape has no 'slice' method -- FreeCAD "
+            "version may be too old for this macro's parting-line step."
+        )
+
+    chord_index = 1 - span_index  # the other of X(0)/Y(1)
+    span_min, span_max = get_span_bounds(shape, span_index)
+    span_range = span_max - span_min
+    if span_range <= 0:
+        raise RuntimeError("Wing solid has zero extent along the span axis.")
+
+    # Inset slightly from the exact root/tip to avoid degenerate sections.
+    inset = max(span_range * 0.001, 1e-4)
+    lo = span_min + inset
+    hi = span_max - inset
+    if num_sections < 2:
+        num_sections = 2
+    step = (hi - lo) / (num_sections - 1)
+
+    stations = []
+    for i in range(num_sections):
+        s = lo + i * step
+        try:
+            wires = shape.slice(axis_vector(span_index), s)
+        except Exception as e:
+            App.Console.PrintWarning(
+                "Wing mould: could not slice at station {:.3f} ({}), skipping.\n".format(s, e)
+            )
+            continue
+        if not wires:
+            continue
+
+        def chord_extent(w):
+            bb = w.BoundBox
+            return (bb.XMax - bb.XMin) if chord_index == 0 else (bb.YMax - bb.YMin)
+
+        wire = max(wires, key=chord_extent)
+        points = wire.discretize(Number=STATION_DISCRETIZE_POINTS)
+        if not points:
+            continue
+        pt_min = min(points, key=lambda p: vec_component(p, chord_index))
+        pt_max = max(points, key=lambda p: vec_component(p, chord_index))
+        stations.append((s, pt_min, pt_max))
+
+    if len(stations) < 2:
+        raise RuntimeError(
+            "Only found {} valid cross-section(s) -- check the span axis "
+            "setting matches the wing's actual orientation.".format(len(stations))
+        )
+
+    return stations, chord_index
+
+
+def build_parting_surface(stations, chord_index, span_index, enclosure_bounds):
+    """Build the visual parting surface (an open shell) spanning the full
+    mould block footprint. This is kept around purely for inspection --
+    see build_knife_solid() for the shape actually used to do the cut."""
+    xmin, xmax, ymin, ymax, zmin, zmax = enclosure_bounds
+    chord_lo, chord_hi = (xmin, xmax) if chord_index == 0 else (ymin, ymax)
+    span_lo, span_hi = (xmin, xmax) if span_index == 0 else (ymin, ymax)
+
+    def station_wire(span_val, pt_min, pt_max):
+        p1 = make_point(span_index, chord_index, span_val, chord_lo, vec_component(pt_min, 2))
+        p2 = pt_min
+        p3 = pt_max
+        p4 = make_point(span_index, chord_index, span_val, chord_hi, vec_component(pt_max, 2))
+        return Part.makePolygon([p1, p2, p3, p4])
+
+    wires = []
+    first_span, first_min, first_max = stations[0]
+    wires.append(station_wire(span_lo, first_min, first_max))
+    for span_val, pt_min, pt_max in stations:
+        wires.append(station_wire(span_val, pt_min, pt_max))
+    last_span, last_min, last_max = stations[-1]
+    wires.append(station_wire(span_hi, last_min, last_max))
+
+    shell = Part.makeLoft(wires, False, True)  # solid=False, ruled=True
+    return shell
+
+
+def combine_shapes(shapes):
+    if len(shapes) == 1:
+        return shapes[0]
+    return shapes[0].multiFuse(shapes[1:])
+
+
+def build_knife_solid(stations, chord_index, span_index, enclosure_bounds):
+    """Build the solid 'knife' representing everything at or below the
+    parting line, from well below the mould block up to the parting
+    points at each station.
+
+    Built as a direct solid loft through CLOSED, individually PLANAR
+    per-station profiles (floor -> up to the parting line -> across ->
+    back down to the floor -> closed). Lofting closed planar cross-
+    sections into a solid is the most standard, best-tested path through
+    the geometry kernel -- much more robust here than building an open
+    surface and extruding it.
+    """
+    xmin, xmax, ymin, ymax, zmin, zmax = enclosure_bounds
+    chord_lo, chord_hi = (xmin, xmax) if chord_index == 0 else (ymin, ymax)
+    span_lo, span_hi = (xmin, xmax) if span_index == 0 else (ymin, ymax)
+    floor_z = zmin - 10.0  # comfortably below the block, avoids tangency
+
+    def closed_station_wire(span_val, pt_min, pt_max):
+        p1 = make_point(span_index, chord_index, span_val, chord_lo, floor_z)
+        p2 = make_point(span_index, chord_index, span_val, chord_lo, vec_component(pt_min, 2))
+        p3 = pt_min
+        p4 = pt_max
+        p5 = make_point(span_index, chord_index, span_val, chord_hi, vec_component(pt_max, 2))
+        p6 = make_point(span_index, chord_index, span_val, chord_hi, floor_z)
+        return Part.makePolygon([p1, p2, p3, p4, p5, p6, p1])
+
+    wires = []
+    first_span, first_min, first_max = stations[0]
+    wires.append(closed_station_wire(span_lo, first_min, first_max))
+    for span_val, pt_min, pt_max in stations:
+        wires.append(closed_station_wire(span_val, pt_min, pt_max))
+    last_span, last_min, last_max = stations[-1]
+    wires.append(closed_station_wire(span_hi, last_min, last_max))
+
+    knife_solid = Part.makeLoft(wires, True, True)  # solid=True, ruled=True
+    return knife_solid
+
+
+def build_flat_parting_face(enclosure_bounds, plane_z=0.0):
+    """Simple flat rectangular face at Z=plane_z spanning the mould
+    block's full footprint -- used purely for visual inspection when the
+    'flat XY parting plane' option is on."""
+    xmin, xmax, ymin, ymax, zmin, zmax = enclosure_bounds
+    p1 = App.Vector(xmin, ymin, plane_z)
+    p2 = App.Vector(xmax, ymin, plane_z)
+    p3 = App.Vector(xmax, ymax, plane_z)
+    p4 = App.Vector(xmin, ymax, plane_z)
+    wire = Part.makePolygon([p1, p2, p3, p4, p1])
+    return Part.Face(wire)
+
+
+def build_flat_knife_solid(enclosure_bounds, plane_z=0.0):
+    """Simple axis-aligned box spanning the mould block's full footprint,
+    from well below the block up to plane_z. A plain box boolean is about
+    as robust as OCC operations get -- this is the 'just make it work'
+    fallback for wings that are flat (no twist/dihedral) at the parting
+    height."""
+    xmin, xmax, ymin, ymax, zmin, zmax = enclosure_bounds
+    margin = 10.0
+    if not (zmin <= plane_z <= zmax):
+        App.Console.PrintWarning(
+            "Wing mould: parting plane Z={:.3f} is outside the mould "
+            "blank's Z range [{:.3f}, {:.3f}] -- the split will produce "
+            "an empty half.\n".format(plane_z, zmin, zmax)
+        )
+    length = xmax - xmin
+    width = ymax - ymin
+    height = plane_z - (zmin - margin)
+    return Part.makeBox(length, width, height, App.Vector(xmin, ymin, zmin - margin))
+
+
+def split_mould_blank(mould_blank_shape, knife_solid):
+    try:
+        bottom_shape = mould_blank_shape.common(knife_solid)
+        top_shape = mould_blank_shape.cut(knife_solid)
+    except Exception as e:
+        raise RuntimeError(
+            "Boolean split failed ({}). This usually means the parting "
+            "surface self-intersects -- most likely from significant "
+            "spanwise twist combined with too few sections. Try raising "
+            "the section count, and check MouldPartingSurface visually "
+            "for kinks or folds.".format(e)
+        )
+
+    top_solids = top_shape.Solids
+    bottom_solids = bottom_shape.Solids
+
+    if not top_solids or not bottom_solids:
+        raise RuntimeError(
+            "Split produced an empty top or bottom half -- the parting "
+            "surface may not fully cross the mould blank. Check the span "
+            "axis setting and MouldPartingSurface's position."
+        )
+
+    return combine_shapes(top_solids), combine_shapes(bottom_solids)
+
+
+def build_mould_halves(parting_settings):
+    doc = App.ActiveDocument
+    if doc is None:
+        raise RuntimeError("No active FreeCAD document.")
+
+    blank_name = OUTPUT_PREFIX + "Blank"
+    blank_obj = doc.getObject(blank_name)
+    if blank_obj is None:
+        raise RuntimeError(
+            "No '{}' object found -- build the mould blank first.".format(blank_name)
+        )
+
+    target = get_target_solid()
+    wing_shape = target.Shape
+
+    span_index = AXIS_INDEX[parting_settings["span_axis"]]
+    num_sections = int(parting_settings["num_sections"])
+
+    bb = blank_obj.Shape.BoundBox
+    enclosure_bounds = (bb.XMin, bb.XMax, bb.YMin, bb.YMax, bb.ZMin, bb.ZMax)
+
+    use_flat_plane = bool(parting_settings.get("use_flat_plane", True))
+
+    if use_flat_plane:
+        plane_z = compute_flat_plane_z(wing_shape, parting_settings)
+        if bool(parting_settings.get("flat_plane_auto", False)):
+            App.Console.PrintMessage(
+                "Wing mould: using flat XY parting plane, auto-centered at "
+                "Z = {:.3f} (wing mid-height)\n".format(plane_z)
+            )
+        else:
+            App.Console.PrintMessage(
+                "Wing mould: using flat XY parting plane at manual Z = {:.3f}\n".format(plane_z)
+            )
+        cutting_shell = build_flat_parting_face(enclosure_bounds, plane_z)
+        knife_solid = build_flat_knife_solid(enclosure_bounds, plane_z)
+    else:
+        span_index = AXIS_INDEX[parting_settings["span_axis"]]
+        num_sections = int(parting_settings["num_sections"])
+
+        App.Console.PrintMessage(
+            "Wing mould: sampling {} span stations (span axis {}, pull axis Z)\n".format(
+                num_sections, parting_settings["span_axis"]
+            )
+        )
+        stations, chord_index = compute_parting_stations(wing_shape, span_index, num_sections)
+
+        App.Console.PrintMessage("Wing mould: building visual parting surface\n")
+        try:
+            cutting_shell = build_parting_surface(stations, chord_index, span_index, enclosure_bounds)
+        except Exception as e:
+            raise RuntimeError("Failed to build the visual parting surface: {}".format(e))
+
+        App.Console.PrintMessage("Wing mould: building solid cutting knife\n")
+        try:
+            knife_solid = build_knife_solid(stations, chord_index, span_index, enclosure_bounds)
+        except Exception as e:
+            raise RuntimeError("Failed to build the solid cutting knife: {}".format(e))
+
+    surface_name = OUTPUT_PREFIX + "PartingSurface"
+    existing_surface = doc.getObject(surface_name)
+    if existing_surface is not None:
+        doc.removeObject(existing_surface.Name)
+    surface_obj = doc.addObject("Part::Feature", surface_name)
+    surface_obj.Shape = cutting_shell
+    surface_obj.Label = surface_name
+    try:
+        surface_obj.ViewObject.Transparency = 60
+    except Exception:
+        pass
+
+    App.Console.PrintMessage("Wing mould: splitting mould blank\n")
+    top_shape, bottom_shape = split_mould_blank(blank_obj.Shape, knife_solid)
+
+    result_objs = []
+    for name, shape in ((OUTPUT_PREFIX + "Top", top_shape), (OUTPUT_PREFIX + "Bottom", bottom_shape)):
+        existing = doc.getObject(name)
+        if existing is not None:
+            doc.removeObject(existing.Name)
+        obj = doc.addObject("Part::Feature", name)
+        obj.Shape = shape
+        obj.Label = name
+        result_objs.append(obj)
+
+    doc.recompute()
+    return result_objs[0], result_objs[1]
+
+
+# ---------------------------------------------------------------------------
+# GUI
+# ---------------------------------------------------------------------------
+
+class WingMouldDialog(QtWidgets.QDialog):
+
+    def __init__(self, parent=None):
+        super(WingMouldDialog, self).__init__(parent)
+        self.setWindowTitle("Wing Mould Settings")
+        self.setMinimumWidth(340)
+
+        self.current_path = SETTINGS_PATH
+        self.spinboxes = {}
+
+        settings = load_settings(self.current_path)
+        self._build_ui(
+            settings["enclosure"], settings["parting"], settings.get("holes", []), settings.get("tabs", {})
+        )
+
+    def _build_ui(self, enclosure_values, parting_values, holes_values, tabs_values):
+        layout = QtWidgets.QVBoxLayout(self)
+
+        enc_group = QtWidgets.QGroupBox("Enclosure extension from bounding box (mm)")
+        enc_form = QtWidgets.QFormLayout()
+        for key, label in ENCLOSURE_FIELDS:
+            spin = QtWidgets.QDoubleSpinBox()
+            spin.setRange(0.0, 1000.0)
+            spin.setDecimals(2)
+            spin.setSingleStep(1.0)
+            spin.setSuffix(" mm")
+            spin.setValue(float(enclosure_values.get(key, 0.0)))
+            enc_form.addRow(label, spin)
+            self.spinboxes[key] = spin
+
+        self.non_rect_checkbox = QtWidgets.QCheckBox("Non rectangular mould (follow wing outline)")
+        self.non_rect_checkbox.setChecked(bool(enclosure_values.get("non_rectangular", False)))
+        self.non_rect_checkbox.setToolTip(
+            "Uses the Span axis setting from the Parting line group below "
+            "to find the wing's root and tip, and connects them into a "
+            "simple 4-sided (trapezoidal) outline. Widen the enclosure "
+            "margins if the wing's planform isn't a straight taper."
+        )
+        enc_form.addRow(self.non_rect_checkbox)
+
+        station_row = QtWidgets.QHBoxLayout()
+        self.station_csv_edit = QtWidgets.QLineEdit()
+        self.station_csv_edit.setText(enclosure_values.get("station_csv_path", ""))
+        self.station_csv_edit.setPlaceholderText(
+            "Optional: WingBuilder station CSV (falls back to tracing the solid if empty)"
+        )
+        self.station_csv_browse_btn = QtWidgets.QPushButton("Browse...")
+        station_row.addWidget(self.station_csv_edit)
+        station_row.addWidget(self.station_csv_browse_btn)
+        enc_form.addRow("Station CSV", station_row)
+        self.station_csv_browse_btn.clicked.connect(self.on_browse_station_csv)
+
+        enc_group.setLayout(enc_form)
+        layout.addWidget(enc_group)
+
+        parting_group = QtWidgets.QGroupBox("Parting line (pull axis fixed at Z)")
+        parting_form = QtWidgets.QFormLayout()
+
+        self.flat_plane_checkbox = QtWidgets.QCheckBox("Use flat XY parting plane (simple)")
+        self.flat_plane_checkbox.setChecked(bool(parting_values.get("use_flat_plane", True)))
+        parting_form.addRow(self.flat_plane_checkbox)
+
+        self.flat_plane_auto_checkbox = QtWidgets.QCheckBox("Auto-center on wing (fallback if LE/TE aren't at Z=0)")
+        self.flat_plane_auto_checkbox.setChecked(bool(parting_values.get("flat_plane_auto", False)))
+        parting_form.addRow(self.flat_plane_auto_checkbox)
+
+        self.flat_plane_z_spin = QtWidgets.QDoubleSpinBox()
+        self.flat_plane_z_spin.setRange(-100000.0, 100000.0)
+        self.flat_plane_z_spin.setDecimals(2)
+        self.flat_plane_z_spin.setSuffix(" mm")
+        self.flat_plane_z_spin.setValue(float(parting_values.get("flat_plane_z", 0.0)))
+        parting_form.addRow("Manual Z", self.flat_plane_z_spin)
+
+        self.span_axis_combo = QtWidgets.QComboBox()
+        self.span_axis_combo.addItems(PARTING_AXIS_OPTIONS)
+        current_axis = parting_values.get("span_axis", "Y")
+        if current_axis in PARTING_AXIS_OPTIONS:
+            self.span_axis_combo.setCurrentText(current_axis)
+        parting_form.addRow("Span axis (contour mode)", self.span_axis_combo)
+
+        self.num_sections_spin = QtWidgets.QSpinBox()
+        self.num_sections_spin.setRange(10, 500)
+        self.num_sections_spin.setValue(int(parting_values.get("num_sections", 80)))
+        parting_form.addRow("Sections (contour mode)", self.num_sections_spin)
+
+        parting_group.setLayout(parting_form)
+        layout.addWidget(parting_group)
+
+        self.flat_plane_checkbox.stateChanged.connect(lambda _: self._update_parting_enabled())
+        self.flat_plane_auto_checkbox.stateChanged.connect(lambda _: self._update_parting_enabled())
+        self._update_parting_enabled()
+
+        holes_group = QtWidgets.QGroupBox("Alignment holes (cut into MouldBlank before splitting)")
+        holes_layout = QtWidgets.QVBoxLayout()
+
+        self.holes_table = QtWidgets.QTableWidget(0, 3)
+        self.holes_table.setHorizontalHeaderLabels(["X (mm)", "Y (mm)", "Diameter (mm)"])
+        self.holes_table.horizontalHeader().setStretchLastSection(True)
+        self.holes_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.holes_table.setMaximumHeight(140)
+        self._populate_holes_table(holes_values)
+        holes_layout.addWidget(self.holes_table)
+
+        holes_btn_row = QtWidgets.QHBoxLayout()
+        self.add_hole_btn = QtWidgets.QPushButton("Add Hole")
+        self.delete_hole_btn = QtWidgets.QPushButton("Delete Selected")
+        self.auto_corner_btn = QtWidgets.QPushButton("Auto-fill 2 Corner Holes")
+        holes_btn_row.addWidget(self.add_hole_btn)
+        holes_btn_row.addWidget(self.delete_hole_btn)
+        holes_btn_row.addWidget(self.auto_corner_btn)
+        holes_layout.addLayout(holes_btn_row)
+
+        holes_group.setLayout(holes_layout)
+        layout.addWidget(holes_group)
+
+        self.add_hole_btn.clicked.connect(self.on_add_hole)
+        self.delete_hole_btn.clicked.connect(self.on_delete_hole)
+        self.auto_corner_btn.clicked.connect(self.on_auto_corner_holes)
+
+        tabs_group = QtWidgets.QGroupBox("Separation tabs (cut before splitting, centered on parting line)")
+        tabs_form = QtWidgets.QFormLayout()
+
+        self.tabs_width_spin = QtWidgets.QDoubleSpinBox()
+        self.tabs_width_spin.setRange(0.1, 200.0)
+        self.tabs_width_spin.setDecimals(2)
+        self.tabs_width_spin.setSuffix(" mm")
+        self.tabs_width_spin.setValue(float(tabs_values.get("width", 5.0)))
+        tabs_form.addRow("Width (span-wise)", self.tabs_width_spin)
+
+        self.tabs_depth_spin = QtWidgets.QDoubleSpinBox()
+        self.tabs_depth_spin.setRange(0.1, 200.0)
+        self.tabs_depth_spin.setDecimals(2)
+        self.tabs_depth_spin.setSuffix(" mm")
+        self.tabs_depth_spin.setValue(float(tabs_values.get("depth", 4.0)))
+        tabs_form.addRow("Depth (into wall)", self.tabs_depth_spin)
+
+        self.tabs_height_spin = QtWidgets.QDoubleSpinBox()
+        self.tabs_height_spin.setRange(0.1, 200.0)
+        self.tabs_height_spin.setDecimals(2)
+        self.tabs_height_spin.setSuffix(" mm")
+        self.tabs_height_spin.setValue(float(tabs_values.get("height", 2.0)))
+        tabs_form.addRow("Height (through parting line)", self.tabs_height_spin)
+
+        self.tabs_count_spin = QtWidgets.QSpinBox()
+        self.tabs_count_spin.setRange(0, 100)
+        self.tabs_count_spin.setValue(int(tabs_values.get("count", 0)))
+        self.tabs_count_spin.setToolTip(
+            "Per long edge -- e.g. 3 gives 3 tabs on each of the two "
+            "edges (6 total), evenly spaced across the wing's real span."
+        )
+        tabs_form.addRow("Count per edge (0 = off)", self.tabs_count_spin)
+
+        tabs_group.setLayout(tabs_form)
+        layout.addWidget(tabs_group)
+
+        self.path_label = QtWidgets.QLabel("Settings file: {}".format(self.current_path))
+        self.path_label.setWordWrap(True)
+        layout.addWidget(self.path_label)
+
+        btn_row1 = QtWidgets.QHBoxLayout()
+        self.load_btn = QtWidgets.QPushButton("Load from file...")
+        self.save_btn = QtWidgets.QPushButton("Save to file...")
+        btn_row1.addWidget(self.load_btn)
+        btn_row1.addWidget(self.save_btn)
+        layout.addLayout(btn_row1)
+
+        btn_row2 = QtWidgets.QHBoxLayout()
+        self.build_btn = QtWidgets.QPushButton("Build Mould Blank")
+        self.split_btn = QtWidgets.QPushButton("Split Into Mould Halves")
+        btn_row2.addWidget(self.build_btn)
+        btn_row2.addWidget(self.split_btn)
+        layout.addLayout(btn_row2)
+
+        self.close_btn = QtWidgets.QPushButton("Close")
+        layout.addWidget(self.close_btn)
+
+        self.status_label = QtWidgets.QLabel("")
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
+
+        self.load_btn.clicked.connect(self.on_load)
+        self.save_btn.clicked.connect(self.on_save)
+        self.build_btn.clicked.connect(self.on_build)
+        self.split_btn.clicked.connect(self.on_split)
+        self.close_btn.clicked.connect(self.close)
+
+    def _populate_holes_table(self, holes):
+        self.holes_table.setRowCount(0)
+        for hole in holes:
+            self._add_hole_row(
+                hole.get("x", 0.0), hole.get("y", 0.0), hole.get("diameter", 6.0)
+            )
+
+    def _add_hole_row(self, x=0.0, y=0.0, diameter=6.0):
+        row = self.holes_table.rowCount()
+        self.holes_table.insertRow(row)
+        self.holes_table.setItem(row, 0, QtWidgets.QTableWidgetItem("{:.2f}".format(x)))
+        self.holes_table.setItem(row, 1, QtWidgets.QTableWidgetItem("{:.2f}".format(y)))
+        self.holes_table.setItem(row, 2, QtWidgets.QTableWidgetItem("{:.2f}".format(diameter)))
+
+    def _current_holes_settings(self):
+        holes = []
+        for row in range(self.holes_table.rowCount()):
+            try:
+                x = float(self.holes_table.item(row, 0).text())
+                y = float(self.holes_table.item(row, 1).text())
+                diameter = float(self.holes_table.item(row, 2).text())
+            except (AttributeError, ValueError, TypeError):
+                continue
+            holes.append({"x": x, "y": y, "diameter": diameter})
+        return holes
+
+    def _current_tabs_settings(self):
+        return {
+            "width": self.tabs_width_spin.value(),
+            "depth": self.tabs_depth_spin.value(),
+            "height": self.tabs_height_spin.value(),
+            "count": self.tabs_count_spin.value(),
+        }
+
+    def _update_parting_enabled(self):
+        flat_mode = self.flat_plane_checkbox.isChecked()
+        contour_mode = not flat_mode
+        self.span_axis_combo.setEnabled(contour_mode)
+        self.num_sections_spin.setEnabled(contour_mode)
+        self.flat_plane_auto_checkbox.setEnabled(flat_mode)
+        self.flat_plane_z_spin.setEnabled(flat_mode and not self.flat_plane_auto_checkbox.isChecked())
+
+    def _current_enclosure_settings(self):
+        settings = {key: spin.value() for key, spin in self.spinboxes.items()}
+        settings["non_rectangular"] = self.non_rect_checkbox.isChecked()
+        settings["station_csv_path"] = self.station_csv_edit.text().strip()
+        return settings
+
+    def on_browse_station_csv(self):
+        start_dir = self.station_csv_edit.text().strip() or self.current_path
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Select WingBuilder Station CSV", start_dir, "CSV Files (*.csv)"
+        )
+        if path:
+            self.station_csv_edit.setText(path)
+
+    def _current_parting_settings(self):
+        return {
+            "span_axis": self.span_axis_combo.currentText(),
+            "num_sections": self.num_sections_spin.value(),
+            "use_flat_plane": self.flat_plane_checkbox.isChecked(),
+            "flat_plane_auto": self.flat_plane_auto_checkbox.isChecked(),
+            "flat_plane_z": self.flat_plane_z_spin.value(),
+        }
+
+    def on_load(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Load Wing Mould Settings", self.current_path, "JSON Files (*.json)"
+        )
+        if not path:
+            return
+        settings = load_settings(path)
+        for key, spin in self.spinboxes.items():
+            spin.setValue(float(settings["enclosure"].get(key, spin.value())))
+        if "non_rectangular" in settings["enclosure"]:
+            self.non_rect_checkbox.setChecked(bool(settings["enclosure"]["non_rectangular"]))
+        if "station_csv_path" in settings["enclosure"]:
+            self.station_csv_edit.setText(settings["enclosure"]["station_csv_path"])
+        parting = settings.get("parting", {})
+        if parting.get("span_axis") in PARTING_AXIS_OPTIONS:
+            self.span_axis_combo.setCurrentText(parting["span_axis"])
+        if "num_sections" in parting:
+            self.num_sections_spin.setValue(int(parting["num_sections"]))
+        if "use_flat_plane" in parting:
+            self.flat_plane_checkbox.setChecked(bool(parting["use_flat_plane"]))
+        if "flat_plane_auto" in parting:
+            self.flat_plane_auto_checkbox.setChecked(bool(parting["flat_plane_auto"]))
+        if "flat_plane_z" in parting:
+            self.flat_plane_z_spin.setValue(float(parting["flat_plane_z"]))
+        self._update_parting_enabled()
+        self._populate_holes_table(settings.get("holes", []))
+        tabs = settings.get("tabs", {})
+        if "width" in tabs:
+            self.tabs_width_spin.setValue(float(tabs["width"]))
+        if "depth" in tabs:
+            self.tabs_depth_spin.setValue(float(tabs["depth"]))
+        if "height" in tabs:
+            self.tabs_height_spin.setValue(float(tabs["height"]))
+        if "count" in tabs:
+            self.tabs_count_spin.setValue(int(tabs["count"]))
+        self.current_path = path
+        self.path_label.setText("Settings file: {}".format(path))
+        self.status_label.setText("Loaded settings from {}".format(path))
+
+    def on_save(self):
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Save Wing Mould Settings", self.current_path, "JSON Files (*.json)"
+        )
+        if not path:
+            return
+        settings = {
+            "enclosure": self._current_enclosure_settings(),
+            "parting": self._current_parting_settings(),
+            "holes": self._current_holes_settings(),
+            "tabs": self._current_tabs_settings(),
+        }
+        try:
+            save_settings(settings, path)
+        except Exception as e:
+            self.status_label.setText("Error saving settings: {}".format(e))
+            return
+        self.current_path = path
+        self.path_label.setText("Settings file: {}".format(path))
+        self.status_label.setText("Saved settings to {}".format(path))
+
+    def on_add_hole(self):
+        self._add_hole_row()
+
+    def on_delete_hole(self):
+        rows = sorted(set(idx.row() for idx in self.holes_table.selectedIndexes()), reverse=True)
+        if not rows:
+            row = self.holes_table.currentRow()
+            if row >= 0:
+                rows = [row]
+        for row in rows:
+            self.holes_table.removeRow(row)
+
+    def on_auto_corner_holes(self):
+        enclosure_settings = self._current_enclosure_settings()
+        try:
+            target = get_target_solid()
+            bounds = compute_enclosure_bounds(target.Shape, enclosure_settings)
+        except Exception as e:
+            self.status_label.setText("Error: {}".format(e))
+            return
+        xmin, xmax, ymin, ymax, zmin, zmax = bounds
+        inset = 10.0
+        self._add_hole_row(xmin + inset, ymin + inset, 6.0)
+        self._add_hole_row(xmax - inset, ymax - inset, 6.0)
+        self.status_label.setText("Added 2 corner alignment holes (6 mm, 10 mm inset).")
+
+    def on_build(self):
+        enclosure_settings = self._current_enclosure_settings()
+        holes_settings = self._current_holes_settings()
+        parting_settings = self._current_parting_settings()
+        tabs_settings = self._current_tabs_settings()
+        try:
+            mould_blank = build_mould_blank(enclosure_settings, holes_settings, parting_settings, tabs_settings)
+        except Exception as e:
+            self.status_label.setText("Error: {}".format(e))
+            App.Console.PrintError("Wing mould: {}\n".format(e))
+            return
+        self.status_label.setText("Mould blank created as '{}'.".format(mould_blank.Label))
+        App.Console.PrintMessage("Wing mould: mould blank created as '{}'\n".format(mould_blank.Label))
+
+    def on_split(self):
+        parting_settings = self._current_parting_settings()
+        try:
+            top_obj, bottom_obj = build_mould_halves(parting_settings)
+        except Exception as e:
+            self.status_label.setText("Error: {}".format(e))
+            App.Console.PrintError("Wing mould: {}\n".format(e))
+            return
+        self.status_label.setText(
+            "Mould halves created as '{}' and '{}'.".format(top_obj.Label, bottom_obj.Label)
+        )
+        App.Console.PrintMessage(
+            "Wing mould: mould halves created as '{}' and '{}'\n".format(top_obj.Label, bottom_obj.Label)
+        )
+
+
+_dialog_instance = None
+
+
+def show_dialog():
+    global _dialog_instance
+    _dialog_instance = WingMouldDialog(Gui.getMainWindow())
+    _dialog_instance.show()
+    return _dialog_instance
+
+
+if __name__ == "__main__":
+    show_dialog()

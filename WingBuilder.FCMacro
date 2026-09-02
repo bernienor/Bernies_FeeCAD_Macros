@@ -1,0 +1,972 @@
+# -*- coding: utf-8 -*-
+__Name__ = 'Wing Builder'
+__Comment__ = 'Parametric wing builder driven by a station CSV of airfoil .dat files'
+__Version__ = '1.0'
+
+"""
+WingBuilder.FCMacro
+
+Parametric wing build, driven by a station definition file. Reads a set of
+airfoil .dat files and places one profile wire per station, positioned and
+scaled per a CSV of (dat_file, y_position, chord[, x_offset, z_offset,
+twist_deg, bend_deg]) rows, then lofts them into a wing.
+
+Convention used throughout:
+    X = chordwise direction (LE at X=0, TE at X=chord, before any x_offset)
+    Y = spanwise direction  (0 at root, increasing toward tip, before bend)
+    Z = thickness direction (up/down, before bend)
+
+Station file format (CSV, header row required):
+    dat_file,y_position,chord
+    root.dat,0,180
+    tip.dat,600,80
+
+x_offset (sweep), z_offset (dihedral), twist_deg and bend_deg columns are
+optional (default 0). twist_deg rotates a section about its own leading
+edge before it's positioned - positive values increase local incidence
+(nose-up), negative values give washout. bend_deg rotates the whole
+cross-section's plane about the chordwise axis - 0 is a normal flat
+station (thickness along Z, growing along Y); as it approaches 90, the
+section reorients into a winglet (thickness along Y, growing along Z).
+bend_deg only reorients the profile - you still place a winglet's stations
+along their own curving path via ordinary y_position/z_offset values.
+
+Run this from the FreeCAD Macro menu (or the Macro toolbar) - it needs the
+GUI, since it shows a dialog for picking the station file and options.
+"""
+
+import csv
+import math
+import os
+
+import FreeCAD as App
+import Part
+
+try:
+    from PySide6 import QtCore, QtWidgets
+except ImportError:
+    from PySide2 import QtCore, QtWidgets
+
+
+# ---------------------------------------------------------------------------
+# Core geometry - unchanged from the plain-script version, just gathered
+# into this one file so the macro is self-contained.
+# ---------------------------------------------------------------------------
+
+def read_airfoil_dat(filepath):
+    """Read a Selig-format airfoil .dat file: an optional name/header line,
+    followed by whitespace-separated 'x y' pairs. x and y are normalized as
+    fractions of chord (x in 0..1, y roughly -0.1..0.1 for typical sections).
+    Non-numeric lines (headers, blanks) are skipped.
+
+    Returns a list of (x, y) tuples in file order.
+
+    Note: this assumes the common Selig-style single-loop format (TE -> upper
+    surface -> LE -> lower surface -> TE). If your .dat files turn out to be
+    in the two-block Lednicer format instead, this will need a tweak.
+    """
+    points = []
+    with open(filepath, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split()
+            if len(parts) != 2:
+                continue
+            try:
+                x, y = float(parts[0]), float(parts[1])
+            except ValueError:
+                continue
+            points.append((x, y))
+    return points
+
+
+def profile_to_3d(points_2d, chord=1.0, position=(0.0, 0.0, 0.0), twist_deg=0.0, bend_deg=0.0):
+    """Scale normalized (x, y) airfoil points by chord, apply twist and
+    bend, and place them in 3D, per the X=chord/Y=span/Z=thickness
+    convention.
+
+    twist_deg rotates the section about the spanwise (Y) axis, pivoting at
+    its own local leading edge (before position is applied). Positive
+    twist_deg increases local incidence (nose-up); negative gives washout.
+
+    bend_deg rotates the whole cross-section's plane about the chordwise
+    (X) axis, applied after twist. At 0 the profile sits flat (thickness
+    along Z, growth along Y); as it approaches 90, thickness rotates into Y
+    and growth rotates into Z - i.e. a winglet. bend_deg only reorients the
+    profile - position (y_position/z_offset) still places it explicitly.
+
+    position is the (X, Y, Z) offset of the profile's leading edge, applied
+    after scaling, twist and bend.
+    """
+    px, py, pz = position
+    theta = math.radians(twist_deg)
+    cos_t, sin_t = math.cos(theta), math.sin(theta)
+    phi = math.radians(bend_deg)
+    cos_b, sin_b = math.cos(phi), math.sin(phi)
+
+    points_3d = []
+    for x, y in points_2d:
+        lx, lz = x * chord, y * chord  # scaled, LE at local (0, 0)
+        rx = lx * cos_t + lz * sin_t   # twist about local LE (Ry rotation)
+        rz = -lx * sin_t + lz * cos_t
+
+        by = -rz * sin_b               # bend about X: split thickness between Y and Z
+        bz = rz * cos_b
+
+        points_3d.append(App.Vector(rx + px, by + py, bz + pz))
+    return points_3d
+
+
+def build_wire(points_3d, close_gap=True):
+    """Build a wire through the given 3D points: an open B-spline through
+    the points as given, plus - if the first and last points don't
+    coincide - an explicit straight edge closing the gap between them,
+    rather than folding that closure into the spline itself.
+
+    Real airfoil .dat files commonly have a blunt (finite-thickness)
+    trailing edge, so the first point (TE, upper surface side) and last
+    point (TE, lower surface side) don't coincide. An earlier version
+    closed this by appending the first point again and interpolating
+    everything as one non-periodic spline - which does produce a closed
+    curve, but the curve's shape right at that seam is whatever a global
+    spline fit happens to produce there, with no guarantee of matching
+    tangents (or even symmetry) between the upper and lower approach to
+    the trailing edge. That asymmetry turned out to be visible downstream,
+    in mould-making: the upper and lower halves disagreed slightly about
+    where exactly the trailing edge closes. A straight line has none of
+    that ambiguity.
+
+    This two-edge construction (spline + explicit closing line) was also
+    the original approach used here, before rounded tip/root caps existed
+    - proven to loft correctly for a plain wing (root/mid/tip). A later
+    single-edge version was adopted specifically to fix a *different*
+    problem: Part.makeLoft losing edge correspondence across many
+    profiles, in a since-abandoned multi-cross-section dome construction
+    that lofted 6-9 closely-spaced two-edge wires together in one call.
+    That construction no longer exists - the current rounded-cap code
+    builds its own explicit closing edges directly and never calls this
+    function - so that specific risk doesn't apply to reverting this.
+    """
+    pts = list(points_3d)
+    curve = Part.BSplineCurve()
+    curve.interpolate(pts)
+    edge = curve.toShape()
+
+    if close_gap and pts[0].distanceToPoint(pts[-1]) > 1e-9:
+        closing_edge = Part.makeLine(pts[-1], pts[0])
+        return Part.Wire([edge, closing_edge])
+
+    return Part.Wire([edge])
+
+
+def bend_growth_direction(bend_deg):
+    """The unit direction a station's cross-section naturally grows toward,
+    given its bend - (0, 1, 0) (pure span) at bend_deg=0, rotating toward
+    (0, 0, 1) (pure vertical) as bend_deg approaches 90. Used to bulge the
+    tip dome outward in the right direction even when the tip station
+    itself is bent (e.g. a winglet tip), instead of assuming pure +Y.
+    """
+    phi = math.radians(bend_deg)
+    return App.Vector(0.0, math.cos(phi), math.sin(phi))
+
+
+def split_upper_lower(points_2d):
+    """Split Selig-ordered airfoil points (TE -> upper -> LE -> lower -> TE)
+    into upper and lower surface point lists, each sorted ascending by x
+    (LE -> TE), so both can be interpolated the same way."""
+    le_idx = min(range(len(points_2d)), key=lambda i: points_2d[i][0])
+    upper = list(reversed(points_2d[: le_idx + 1]))  # was TE->LE, now LE->TE
+    lower = points_2d[le_idx:]                        # already LE->TE
+    return upper, lower
+
+
+def interp_surface(surface_points, x):
+    """Linear interpolation of y at a given x over one surface's points
+    (list of (x, y), sorted ascending by x). Clamps at the ends."""
+    xs = [p[0] for p in surface_points]
+    if x <= xs[0]:
+        return surface_points[0][1]
+    if x >= xs[-1]:
+        return surface_points[-1][1]
+    for i in range(len(xs) - 1):
+        if xs[i] <= x <= xs[i + 1]:
+            x0, y0 = surface_points[i]
+            x1, y1 = surface_points[i + 1]
+            if x1 == x0:
+                return y0
+            t = (x - x0) / (x1 - x0)
+            return y0 + t * (y1 - y0)
+    return surface_points[-1][1]
+
+
+def build_dome_profiles(dat_path, chord, position, twist_deg=0.0, bend_deg=0.0, direction=1.0):
+    """Build the LE-to-TE sequence of profiles for a tip/root cap that's
+    rounded the way you'd see it looking straight down the leading edge:
+    a half-circle bulging outward from the wing's surface, swept from the
+    leading edge back to the trailing edge.
+
+    Chordwise stations are the exact x locations of the real airfoil data
+    - the union of the upper and lower surface's own point positions
+    (deduplicated, sorted) - not a separately-chosen resampling. Where a
+    station's x is a genuine point on a given surface, its y comes from
+    that point exactly (interp_surface passes stored values through
+    unchanged when x matches one of its own points); interpolation only
+    happens for the handful of x's that exist on one surface but not the
+    other (upper and lower don't always share identical panel spacing).
+    This means the cap's ruled "back" - the stack of closing edges swept
+    from LE to TE - approximates the wing's own flat tip/root face using
+    the same point density and placement the wing's own wire is built
+    from, rather than an independently-chosen approximation with its own
+    separate error. It doesn't make the two surfaces identical (a ruled
+    polygon through the same points as a B-spline still isn't the same
+    curve as that B-spline between those points), but it's about as close
+    as this construction can get without directly reusing the wing's own
+    boundary wire, which would need the cap's rounded skin built from open
+    (non-closed) profiles instead of the closed "D" shapes below - not
+    attempted here since Part.makeLoft's handling of that combination is
+    less certain.
+
+    At each station, the profile is a closed "D" shape: a semicircular
+    arc from the upper surface point, bulging outward in the direction
+    given by bend_growth_direction(bend_deg), to the lower surface point
+    - centered on the local mean camber line (the average of the
+    upper/lower distance from the chordline), with radius equal to the
+    local half-thickness - closed off with a straight edge back across
+    the gap, which lies exactly on the wing's own surface at that
+    station. direction flips which way it bulges: +1.0 for a TIP (further
+    outboard, the way the wing already grows), -1.0 for a ROOT (the
+    opposite way, away from the rest of the wing).
+
+    The very first profile, at the true leading edge (x=0), is a Vertex
+    instead of a D shape - the airfoil's upper and lower surfaces
+    genuinely meet there (radius exactly 0, confirmed directly against
+    real airfoil data, not an approximation), which is exactly the
+    well-supported way to taper a loft to a point.
+
+    Every other profile is planar - an arc and a straight line, both
+    confined to a single plane perpendicular to the local chord direction
+    at that station - unlike looping all the way around the whole airfoil
+    with a varying bulge, which is not planar and is what made capping so
+    unreliable in an earlier version of this. Because these are planar,
+    Part.makeLoft's own native solid=True capping - the same mechanism
+    already proven reliable for the wing's own flat-ended profiles -
+    handles the trailing-edge end directly, with nothing to build or
+    orient by hand.
+    """
+    points_2d = read_airfoil_dat(dat_path)
+    upper, lower = split_upper_lower(points_2d)
+    growth_dir = bend_growth_direction(bend_deg)
+
+    xs = sorted(set([p[0] for p in upper] + [p[0] for p in lower]))
+
+    profiles = []
+    for x in xs:
+        yu = interp_surface(upper, x)
+        yl = interp_surface(lower, x)
+
+        p_upper = profile_to_3d([(x, yu)], chord=chord, position=position, twist_deg=twist_deg, bend_deg=bend_deg)[0]
+        p_lower = profile_to_3d([(x, yl)], chord=chord, position=position, twist_deg=twist_deg, bend_deg=bend_deg)[0]
+
+        center = App.Vector(
+            (p_upper.x + p_lower.x) / 2.0,
+            (p_upper.y + p_lower.y) / 2.0,
+            (p_upper.z + p_lower.z) / 2.0,
+        )
+        radius = p_upper.distanceToPoint(p_lower) / 2.0
+
+        if radius < 1e-6:
+            profiles.append(Part.Vertex(center))
+        else:
+            apex = App.Vector(
+                center.x + growth_dir.x * direction * radius,
+                center.y + growth_dir.y * direction * radius,
+                center.z + growth_dir.z * direction * radius,
+            )
+            arc_edge = Part.Arc(p_upper, apex, p_lower).toShape()
+            closing_edge = Part.makeLine(p_lower, p_upper)
+            profiles.append(Part.Wire([arc_edge, closing_edge]))
+
+    return profiles
+
+
+def build_profile(doc, dat_path, chord=1.0, position=(0.0, 0.0, 0.0), twist_deg=0.0, bend_deg=0.0, name="Profile"):
+    """Read one .dat file and add it to the document as a Part::Feature wire.
+    Returns the created document object."""
+    points_2d = read_airfoil_dat(dat_path)
+    points_3d = profile_to_3d(points_2d, chord=chord, position=position, twist_deg=twist_deg, bend_deg=bend_deg)
+    wire = build_wire(points_3d)
+
+    obj = doc.addObject("Part::Feature", name)
+    obj.Shape = wire
+    return obj
+
+
+def read_station_file(filepath):
+    """Read a station definition CSV with columns: dat_file, y_position, chord.
+    y_position and chord are in the same units as the rest of the model
+    (mm by default). dat_file paths are resolved relative to the station
+    file's own directory, so the whole project folder stays portable if you
+    move it.
+
+    Optional columns x_offset, z_offset (sweep/dihedral), twist_deg and
+    bend_deg default to 0 if not present in the file.
+
+    The header row is optional - if the first row's y_position/chord columns
+    don't parse as numbers, it's treated as a header and skipped; otherwise
+    it's treated as data, assumed to be in dat_file,y_position,chord order.
+
+    Returns a list of station dicts, sorted by y_position ascending
+    (root to tip), regardless of the order rows appear in the file.
+    """
+    base_dir = os.path.dirname(os.path.abspath(filepath))
+
+    # newline="" hands line-ending handling to the csv module itself, so
+    # Windows CRLF line endings (\r\n) are parsed correctly without a
+    # stray \r leaking into the last field of each row.
+    with open(filepath, newline="") as f:
+        rows = list(csv.reader(f, skipinitialspace=True))
+
+    rows = [r for r in rows if r and r[0].strip() and not r[0].strip().startswith("#")]
+    if not rows:
+        return []
+
+    default_fields = ["dat_file", "y_position", "chord", "x_offset", "z_offset", "twist_deg", "bend_deg"]
+
+    def looks_like_header(row):
+        try:
+            float(row[1])
+            float(row[2])
+            return False
+        except (ValueError, IndexError):
+            return True
+
+    if looks_like_header(rows[0]):
+        fieldnames = [h.strip() for h in rows[0]]
+        data_rows = rows[1:]
+    else:
+        fieldnames = default_fields[: len(rows[0])]
+        data_rows = rows
+
+    stations = []
+    for row in data_rows:
+        # .strip() removes any leading/trailing whitespace *and* stray \r,
+        # plus surrounding quote characters some editors/exports leave in.
+        row = [cell.strip().strip('"') for cell in row]
+        d = dict(zip(fieldnames, row))
+
+        dat_file = d.get("dat_file", "")
+        if not dat_file:
+            continue
+        dat_path = dat_file
+        if not os.path.isabs(dat_path):
+            dat_path = os.path.join(base_dir, dat_path)
+
+        stations.append({
+            "dat_file": dat_path,
+            "y_position": float(d["y_position"]),
+            "chord": float(d["chord"]),
+            "x_offset": float(d.get("x_offset") or 0.0),
+            "z_offset": float(d.get("z_offset") or 0.0),
+            "twist_deg": float(d.get("twist_deg") or 0.0),
+            "bend_deg": float(d.get("bend_deg") or 0.0),
+        })
+    stations.sort(key=lambda s: s["y_position"])
+    return stations
+
+
+def build_wing_profiles(doc, station_file):
+    """Read a station file and build one profile wire per station: scaled to
+    its chord, twisted about its own leading edge, bent about the chordwise
+    axis, and placed at (x_offset, y_position, z_offset) - i.e. sweep,
+    span, and dihedral.
+
+    Returns the list of created document objects, ordered root to tip.
+    """
+    stations = read_station_file(station_file)
+    profiles = []
+    for i, st in enumerate(stations):
+        position = (st["x_offset"], st["y_position"], st["z_offset"])
+        obj = build_profile(
+            doc,
+            st["dat_file"],
+            chord=st["chord"],
+            position=position,
+            twist_deg=st["twist_deg"],
+            bend_deg=st["bend_deg"],
+            name=f"Profile_{i:02d}",
+        )
+        profiles.append(obj)
+    return profiles
+
+
+def loft_wing(doc, wires, dome_profiles=None, root_dome_profiles=None, ruled=True, solid=True, name="Wing"):
+    """Build the wing - and any requested tip/root caps - as separate
+    document objects, added directly to doc.
+
+    wires: the wing's own station profiles, root to tip. Always lofted
+    with `ruled` exactly as given - this part is never altered by whether
+    a tip or root cap is added, so the wing you defined is the wing you
+    get.
+
+    dome_profiles / root_dome_profiles: optional profile lists (see
+    build_dome_profiles) for a cap rounded the way you'd see it looking
+    straight down the leading edge - a half-circle swept from the LE back
+    to the TE - independent of each other, so either end, both, or
+    neither can be rounded. Each list starts with a Vertex at the true LE
+    (where the airfoil's upper and lower surfaces genuinely meet, radius
+    0) and continues through a sequence of planar "D" shaped cross-
+    sections back to the TE; every profile after the first is flat, so
+    Part.makeLoft's own native capping handles the TE end directly, the
+    same proven-reliable mechanism already used for the wing's own
+    flat-ended profiles.
+
+    Each requested cap becomes its own separate Part::Feature object
+    (name + "_TipCap" / name + "_RootCap") rather than being boolean-fused
+    onto the main wing. Fusing two solids that touch along an *exactly*
+    coincident face, with no genuine 3D overlap, is a known-difficult case
+    for OCC's boolean engine - it can decide there's nothing new to add
+    and hand back the original solid unchanged, which is exactly what
+    happened when this was tried: a valid solid, with the cap silently
+    missing. Separate objects sidestep that entirely - nothing needs to be
+    merged; each piece is independently well-formed, and they sit exactly
+    flush with each other in the document (the cap's own stacked closing
+    edges approximate the wing's flat end face closely enough, at the
+    density build_dome_profiles uses, to sit flush without needing to
+    reference the wing's own boundary wire at all). For most downstream
+    uses (3D printing, exporting to STEP/STL) multiple touching solids
+    behave the same as one fused body. If you need a single fused Solid
+    feature, FreeCAD's own interactive Part > Boolean > Union tool,
+    applied by hand afterward, tends to handle this case more robustly
+    than a blind scripted attempt, and shows directly what it did.
+
+    Each cap is connected internally with ruled=True regardless of the
+    main `ruled` setting, since that's what's actually proven stable with
+    many closely-spaced steps; a smooth fit through them repeatedly
+    produced self-intersecting geometry in an earlier version of this.
+
+    solid=True builds each piece as a solid, relying entirely on
+    Part.makeLoft's own native capping in every case - nothing here is
+    capped or oriented by hand. solid=False produces open shells
+    throughout - no wall thickness.
+
+    Every wire must already be closed (see build_wire). Returns the list
+    of created document objects: the main wing first, then the tip cap
+    (if any), then the root cap (if any).
+    """
+    def build_main():
+        if solid:
+            try:
+                s = Part.makeLoft(wires, True, ruled)
+                if s.isValid():
+                    return s
+                print("Wing Builder: main wing solid failed a validity check - using an open shell instead.")
+            except Exception as e:
+                print(f"Wing Builder: could not build the main wing as a solid ({e}) - using an open shell instead.")
+        return Part.Shell(list(Part.makeLoft(wires, False, ruled).Faces))
+
+    def build_cap(profiles, label):
+        if solid:
+            try:
+                s = Part.makeLoft(profiles, True, True)  # solid=True, ruled=True internally
+                if s.isValid():
+                    return s
+                print(f"Wing Builder: {label} solid failed a validity check - using an open shell instead.")
+            except Exception as e:
+                print(f"Wing Builder: could not build {label} as a solid ({e}) - using an open shell instead.")
+        return Part.Shell(list(Part.makeLoft(profiles, False, True).Faces))
+
+    objs = []
+
+    main_obj = doc.addObject("Part::Feature", name)
+    main_obj.Shape = build_main()
+    objs.append(main_obj)
+
+    if dome_profiles:
+        tip_obj = doc.addObject("Part::Feature", f"{name}_TipCap")
+        tip_obj.Shape = build_cap(dome_profiles, "tip cap")
+        objs.append(tip_obj)
+
+    if root_dome_profiles:
+        root_obj = doc.addObject("Part::Feature", f"{name}_RootCap")
+        root_obj.Shape = build_cap(root_dome_profiles, "root cap")
+        objs.append(root_obj)
+
+    return objs
+
+
+def fuse_wing_solids(doc, objs, name, ignore_volume_check=False):
+    """Fuse the given document objects (main wing + cap(s)) into one solid,
+    using FreeCAD's PartDesign::Boolean feature wrapped in a
+    PartDesign::Body - not Shape.fuse() and not the plain Part workbench
+    Boolean Union. This is a different code path, confirmed by the user
+    via FreeCAD's own macro recorder to work correctly on this exact kind
+    of geometry (main wing + tip cap), after three separate Shape.fuse()
+    attempts had each failed in a different way (see specifications.md
+    §8 design history item 7 and §9) - missing material, orientation
+    errors, and self-intersecting excess volume. The recorded sequence is
+    replicated closely (create Body, create Boolean, addObjects, an
+    intermediate recompute, then set Type, then recompute again) rather
+    than simplified, since PartDesign::Boolean's behavior isn't something
+    to guess at.
+
+    Only called when there's more than one object to fuse - i.e. only
+    when rounding was actually requested; nothing is fused when Rounding
+    is None, since there's only the main wing to begin with.
+
+    Verifies the result two ways - Shape.isValid(), and (unless
+    ignore_volume_check) the fused volume against the sum of the input
+    pieces' volumes. isValid() failure always rejects the fuse; it's a
+    basic topological check, not the one in question here. The volume
+    check is a separate matter: FreeCAD's PartDesign::Boolean has open,
+    confirmed upstream reports of producing genuinely incorrect results
+    - sometimes silently, sometimes depending on operand order - and
+    separately, of computing a wrong volume for a boolean result even
+    when the shape looks visually correct. So a volume mismatch here
+    isn't necessarily this project's own construction being wrong; it may
+    just be this specific FreeCAD feature. ignore_volume_check=True skips
+    treating a mismatch as a failure - the fuse is kept regardless - but
+    every volume is still printed either way, specifically so the
+    possibility of a mismatch stays visible rather than silently hidden.
+
+    Individual volumes are read *before* PartDesign::Boolean.addObjects()
+    touches the source objects, not after - PartDesign may hide or
+    otherwise alter a consumed object once it belongs to a Boolean
+    feature, and reading .Shape.Volume only after that point risked
+    comparing against a wrong "expected" figure rather than the fuse
+    itself actually being wrong.
+
+    Returns the created Body object on success (including when a volume
+    mismatch was ignored); None if isValid() failed, an unignored volume
+    mismatch was found, or an exception was raised - in which case the
+    caller leaves the original separate objects untouched and visible.
+    """
+    if len(objs) < 2:
+        return None
+
+    volumes = [o.Shape.Volume for o in objs]  # read before PartDesign touches the source objects
+    expected_volume = sum(volumes)
+    for o, v in zip(objs, volumes):
+        print(f"Wing Builder: '{o.Name}' volume = {v:.1f}")
+    print(f"Wing Builder: expected fused volume (sum) = {expected_volume:.1f}")
+
+    body = None
+    try:
+        # Matches the recorded order (cap(s) first, main wing last) -
+        # objs is [main, tip_cap?, root_cap?], so reverse it.
+        ordered = list(objs[1:]) + [objs[0]]
+
+        body = doc.addObject("PartDesign::Body", f"{name}_Body")
+        body.AllowCompound = False
+        boolean = body.newObject("PartDesign::Boolean", f"{name}_Boolean")
+        boolean.addObjects(ordered)
+        doc.recompute()
+        boolean.Type = 0  # Union
+        doc.recompute()
+
+        fused_shape = boolean.Shape
+        actual_volume = fused_shape.Volume
+        print(f"Wing Builder: actual fused volume = {actual_volume:.1f}")
+
+        if not fused_shape.isValid():
+            raise ValueError("fused shape failed a validity check")
+
+        volume_mismatch = (
+            expected_volume > 0
+            and abs(actual_volume - expected_volume) / expected_volume > 0.02
+        )
+        if volume_mismatch:
+            if ignore_volume_check:
+                print(
+                    f"Wing Builder: fused volume ({actual_volume:.1f}) does not match the "
+                    f"expected ({expected_volume:.1f}) - ignoring per the 'Ignore the volume "
+                    f"check' setting. This is a known FreeCAD/PartDesign::Boolean limitation, "
+                    f"not necessarily a sign anything is actually wrong - check the result "
+                    f"visually."
+                )
+            else:
+                raise ValueError(
+                    f"fused volume ({actual_volume:.1f}) does not match the expected "
+                    f"({expected_volume:.1f}) - a piece may be missing, or the result may be malformed"
+                )
+
+        return body
+    except Exception as e:
+        print(f"Wing Builder: could not fuse the solids ({e}) - keeping the separate solids instead.")
+        if body is not None:
+            try:
+                for child in list(body.Group):
+                    doc.removeObject(child.Name)
+                doc.removeObject(body.Name)
+            except Exception:
+                pass
+        return None
+
+
+def build_wing(station_file, ruled=True, solid=True, round_tip=True, round_root=False,
+                fuse_solids=True, ignore_volume_check=False, show_profiles=False):
+    """Build the whole wing from a station file, with the given options.
+    Uses the active document if one is open, otherwise creates a new one.
+
+    fuse_solids=True (default): whenever rounding produces more than one
+    piece (Tip only, Root only, or Both ends) and solid=True, the pieces
+    are automatically fused into one solid via fuse_wing_solids(). If the
+    fuse succeeds, its result replaces the separate objects as the
+    visible output (the separate objects are kept in the document, just
+    hidden). If it doesn't - a message is printed - the separate objects
+    are left visible instead, unchanged, exactly as if no fuse had been
+    attempted. fuse_solids=False skips the attempt entirely, leaving the
+    separate objects as the final result.
+
+    ignore_volume_check=False (default): passed straight through to
+    fuse_wing_solids - see there for why a volume mismatch isn't
+    necessarily a sign of a real problem with this project's own
+    construction, given known FreeCAD/PartDesign::Boolean limitations.
+
+    Returns the list of created wing objects: the fused Body alone if the
+    fuse succeeded, otherwise the main wing then tip/root caps if
+    requested (see loft_wing).
+    """
+    doc = App.ActiveDocument if App.ActiveDocument else App.newDocument("Wing")
+
+    stations = read_station_file(station_file)
+    if len(stations) < 2:
+        raise ValueError(f"Need at least 2 stations in '{station_file}' to build a wing.")
+
+    profiles = build_wing_profiles(doc, station_file)
+    wires = [p.Shape for p in profiles]
+
+    dome_profiles = None
+    if round_tip:
+        tip = stations[-1]  # stations sorted root-to-tip already
+        tip_position = (tip["x_offset"], tip["y_position"], tip["z_offset"])
+        dome_profiles = build_dome_profiles(
+            tip["dat_file"], tip["chord"], tip_position, tip["twist_deg"], tip["bend_deg"], direction=1.0
+        )
+
+    root_dome_profiles = None
+    if round_root:
+        root = stations[0]
+        root_position = (root["x_offset"], root["y_position"], root["z_offset"])
+        root_dome_profiles = build_dome_profiles(
+            root["dat_file"], root["chord"], root_position, root["twist_deg"], root["bend_deg"], direction=-1.0
+        )
+
+    name = "WingSolid" if solid else "WingShell"
+    wing_objs = loft_wing(
+        doc, wires, dome_profiles=dome_profiles, root_dome_profiles=root_dome_profiles,
+        ruled=ruled, solid=solid, name=name,
+    )
+
+    if App.GuiUp and not show_profiles:
+        for p in profiles:
+            p.ViewObject.Visibility = False
+
+    fused_body = None
+    if fuse_solids and solid and len(wing_objs) > 1:
+        fused_body = fuse_wing_solids(doc, wing_objs, name, ignore_volume_check=ignore_volume_check)
+        if fused_body is not None and App.GuiUp:
+            for o in wing_objs:
+                o.ViewObject.Visibility = False
+
+    doc.recompute()
+
+    if App.GuiUp:
+        import FreeCADGui as Gui
+        Gui.activeDocument().activeView().viewAxonometric()
+        Gui.SendMsgToActiveView("ViewFit")
+
+    obj_summary = ", ".join(f"'{o.Name}' ({o.Shape.ShapeType})" for o in wing_objs)
+    print(f"Built {len(profiles)} profile(s), lofted into: {obj_summary} ({'ruled' if ruled else 'smooth'}).")
+    if fused_body is not None:
+        print(f"Wing Builder: fused into '{fused_body.Name}' ({fused_body.Shape.ShapeType}).")
+
+    not_solid = [o for o in wing_objs if o.Shape.ShapeType != "Solid"]
+    if solid and not_solid:
+        names = ", ".join(f"'{o.Name}'" for o in not_solid)
+        print(
+            f"Wing Builder: Solid was requested but {names} came out as a Shell - "
+            f"see any 'Wing Builder: could not build...' message above this line for why."
+        )
+
+    return [fused_body] if fused_body is not None else wing_objs
+
+
+# ---------------------------------------------------------------------------
+# Station file help content
+# ---------------------------------------------------------------------------
+
+STATION_FILE_EXAMPLE = """dat_file,y_position,chord,x_offset,z_offset,twist_deg,bend_deg
+root.dat,0,180,0,0,0,0
+mid.dat,500,140,20,10,0,0
+tip.dat,750,80,40,25,-3,0"""
+
+STATION_FILE_HELP_HTML = """
+<h3>Station file format</h3>
+<p>A CSV file, one row per wing station (cross-section). Rows are sorted
+automatically by <code>y_position</code>, so the order they appear in the
+file doesn't matter.</p>
+
+<table cellspacing="6">
+<tr><td valign="top"><b>dat_file</b></td><td valign="top">required</td>
+    <td valign="top">Path to the airfoil .dat file for this station.
+    Relative paths are resolved against the folder the stations file
+    itself is in, so a project folder stays portable if you move it.</td></tr>
+<tr><td valign="top"><b>y_position</b></td><td valign="top">required</td>
+    <td valign="top">Spanwise position of this station's leading edge
+    (0 at the root).</td></tr>
+<tr><td valign="top"><b>chord</b></td><td valign="top">required</td>
+    <td valign="top">Chord length at this station.</td></tr>
+<tr><td valign="top"><b>x_offset</b></td><td valign="top">optional, default 0</td>
+    <td valign="top">Leading-edge offset in X - i.e. sweep.</td></tr>
+<tr><td valign="top"><b>z_offset</b></td><td valign="top">optional, default 0</td>
+    <td valign="top">Leading-edge offset in Z - i.e. dihedral.</td></tr>
+<tr><td valign="top"><b>twist_deg</b></td><td valign="top">optional, default 0</td>
+    <td valign="top">Rotation about this station's own leading edge.
+    Positive increases local incidence (nose-up); negative gives washout.</td></tr>
+<tr><td valign="top"><b>bend_deg</b></td><td valign="top">optional, default 0</td>
+    <td valign="top">Rotation of the whole cross-section about the chordwise
+    axis. 0 is a normal flat station; near 90 reorients it for a winglet
+    (thickness becomes horizontal, growth direction becomes vertical).</td></tr>
+</table>
+
+<p>All lengths and positions use the same units as the rest of your model
+(mm by default).</p>
+
+<p><b>Notes</b></p>
+<ul>
+<li>The header row is optional - if it's missing, columns are assumed to be
+in the order shown above.</li>
+<li>Blank lines and lines starting with <code>#</code> are ignored.</li>
+<li>At least 2 stations are required to build a wing.</li>
+<li>The first station is the root, the last is the tip - which one(s), if
+any, get a rounded cap is chosen with the Rounding option in the main
+dialog (None / Tip only / Root only / Both ends). This never changes the
+stations themselves, only whether extra cap geometry is added beyond
+them.</li>
+</ul>
+"""
+
+
+class StationFileHelpDialog(QtWidgets.QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Station File Format")
+        self.setMinimumSize(560, 480)
+
+        layout = QtWidgets.QVBoxLayout(self)
+
+        browser = QtWidgets.QTextBrowser()
+        browser.setHtml(STATION_FILE_HELP_HTML)
+        layout.addWidget(browser)
+
+        layout.addWidget(QtWidgets.QLabel("Example (select all and copy, or use the button below):"))
+
+        example = QtWidgets.QPlainTextEdit()
+        example.setPlainText(STATION_FILE_EXAMPLE)
+        example.setReadOnly(True)
+        example.setStyleSheet("font-family: Consolas, 'Courier New', monospace;")
+        example.setMaximumHeight(110)
+        layout.addWidget(example)
+
+        button_row = QtWidgets.QHBoxLayout()
+        copy_btn = QtWidgets.QPushButton("Copy Example")
+        copy_btn.clicked.connect(self.copy_example)
+        button_row.addWidget(copy_btn)
+        button_row.addStretch()
+        close_btn = QtWidgets.QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        button_row.addWidget(close_btn)
+        layout.addLayout(button_row)
+
+    def copy_example(self):
+        QtWidgets.QApplication.clipboard().setText(STATION_FILE_EXAMPLE)
+
+
+# ---------------------------------------------------------------------------
+# GUI
+# ---------------------------------------------------------------------------
+
+class WingBuilderDialog(QtWidgets.QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Wing Builder")
+        self.setMinimumWidth(440)
+
+        layout = QtWidgets.QVBoxLayout(self)
+
+        file_group = QtWidgets.QGroupBox("Station file")
+        file_layout = QtWidgets.QHBoxLayout(file_group)
+        self.file_edit = QtWidgets.QLineEdit()
+        self.file_edit.setPlaceholderText("Path to your stations.csv")
+        browse_btn = QtWidgets.QPushButton("Browse...")
+        browse_btn.clicked.connect(self.browse_file)
+        help_btn = QtWidgets.QPushButton("Help...")
+        help_btn.setToolTip("Show the station file format, column explanations, and a copyable example")
+        help_btn.clicked.connect(self.show_help)
+        file_layout.addWidget(self.file_edit)
+        file_layout.addWidget(browse_btn)
+        file_layout.addWidget(help_btn)
+        layout.addWidget(file_group)
+
+        options_group = QtWidgets.QGroupBox("Options")
+        options_layout = QtWidgets.QVBoxLayout(options_group)
+
+        self.ruled_check = QtWidgets.QCheckBox("Ruled (straight sections between profiles)")
+        self.ruled_check.setToolTip(
+            "Checked: straight-line taper between each pair of stations - the usual\n"
+            "choice for a wing built from flat panels between ribs.\n"
+            "Unchecked: a smooth continuous blend through all stations instead."
+        )
+        self.ruled_check.setChecked(True)
+        options_layout.addWidget(self.ruled_check)
+
+        self.solid_check = QtWidgets.QCheckBox("Solid (uncheck for an open shell)")
+        self.solid_check.setToolTip(
+            "Checked: a closed, watertight solid, capped at both ends.\n"
+            "Unchecked: an open shell - no end caps, no wall thickness - useful if\n"
+            "you plan to shell/thicken it yourself, or want a surface for another\n"
+            "operation rather than a solid."
+        )
+        self.solid_check.setChecked(True)
+        options_layout.addWidget(self.solid_check)
+
+        rounding_group = QtWidgets.QGroupBox("Rounding")
+        rounding_layout = QtWidgets.QVBoxLayout(rounding_group)
+        rounding_group.setToolTip(
+            "None: both ends are left flat, capped square at your first/last station.\n"
+            "Tip only: adds a rounded cap beyond your last (outermost) station.\n"
+            "Root only: adds a rounded cap beyond your first station, extending\n"
+            "away from the rest of the wing - e.g. the bottom of a stand-alone\n"
+            "fin/stabiliser defined bottom-to-top, where the root needs its own\n"
+            "cap rather than blending into a fuselage.\n"
+            "Both ends: rounds both - e.g. a vertical stabiliser where neither end\n"
+            "attaches to anything.\n"
+            "In every case, the wing itself (and Ruled's effect on it) is\n"
+            "completely unchanged - rounding only adds extra geometry beyond the\n"
+            "real stations."
+        )
+
+        self.round_none_radio = QtWidgets.QRadioButton("None")
+        self.round_tip_radio = QtWidgets.QRadioButton("Tip only")
+        self.round_root_radio = QtWidgets.QRadioButton("Root only")
+        self.round_both_radio = QtWidgets.QRadioButton("Both ends")
+        self.round_tip_radio.setChecked(True)  # matches the previous default behavior
+
+        for rb in (self.round_none_radio, self.round_tip_radio, self.round_root_radio, self.round_both_radio):
+            rounding_layout.addWidget(rb)
+
+        options_layout.addWidget(rounding_group)
+
+        self.fuse_check = QtWidgets.QCheckBox("Fuse into one solid when rounding is used")
+        self.fuse_check.setToolTip(
+            "Only relevant when Rounding above produces more than one piece.\n"
+            "Checked (default): after building the wing and its cap(s), tries to\n"
+            "fuse them into a single solid via FreeCAD's PartDesign Boolean\n"
+            "feature. Verified by shape validity and by volume (both printed to\n"
+            "the Report View either way) - if the fuse doesn't check out, a\n"
+            "message explains why and the separate solids are left untouched.\n"
+            "Unchecked: skip the attempt and keep the separate solids as the\n"
+            "final result."
+        )
+        self.fuse_check.setChecked(True)
+        options_layout.addWidget(self.fuse_check)
+
+        self.ignore_volume_check_check = QtWidgets.QCheckBox("Ignore the volume check of fused objects")
+        self.ignore_volume_check_check.setToolTip(
+            "Only relevant when a fuse (above) is actually attempted.\n"
+            "FreeCAD's PartDesign Boolean feature has open, confirmed upstream\n"
+            "reports of computing a wrong volume for a boolean result even when\n"
+            "the shape looks visually correct - this is a known limitation of\n"
+            "that FreeCAD feature, not necessarily a sign this project's own\n"
+            "geometry is wrong.\n"
+            "Unchecked (default): a volume mismatch is treated as a failed fuse -\n"
+            "the separate solids are kept instead, same as any other failure.\n"
+            "Checked: keep the fused result even if its volume doesn't match the\n"
+            "expected sum - every volume is still printed to the Report View\n"
+            "either way, so you can judge for yourself. Use this if you've\n"
+            "checked a fused result by hand and are satisfied it's correct\n"
+            "despite the mismatch."
+        )
+        self.ignore_volume_check_check.setChecked(False)
+        options_layout.addWidget(self.ignore_volume_check_check)
+
+        self.show_profiles_check = QtWidgets.QCheckBox("Keep station profile wires visible")
+        self.show_profiles_check.setToolTip(
+            "Checked: leave the individual station wires visible in the tree,\n"
+            "alongside the final lofted shape.\n"
+            "Unchecked (default): hide them once the loft succeeds."
+        )
+        self.show_profiles_check.setChecked(False)
+        options_layout.addWidget(self.show_profiles_check)
+
+        layout.addWidget(options_group)
+
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def browse_file(self):
+        start_dir = os.path.dirname(self.file_edit.text()) if self.file_edit.text() else ""
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Select station file", start_dir, "CSV files (*.csv);;All files (*)"
+        )
+        if path:
+            self.file_edit.setText(path)
+
+    def show_help(self):
+        StationFileHelpDialog(self).exec()
+
+    def values(self):
+        return {
+            "station_file": self.file_edit.text().strip(),
+            "ruled": self.ruled_check.isChecked(),
+            "solid": self.solid_check.isChecked(),
+            "round_tip": self.round_tip_radio.isChecked() or self.round_both_radio.isChecked(),
+            "round_root": self.round_root_radio.isChecked() or self.round_both_radio.isChecked(),
+            "fuse_solids": self.fuse_check.isChecked(),
+            "ignore_volume_check": self.ignore_volume_check_check.isChecked(),
+            "show_profiles": self.show_profiles_check.isChecked(),
+        }
+
+
+def run():
+    if not App.GuiUp:
+        print("Wing Builder needs the FreeCAD GUI (it shows a dialog for picking "
+              "options) - run it from within FreeCAD, not freecadcmd.")
+        return
+
+    import FreeCADGui as Gui
+    parent = Gui.getMainWindow()
+
+    dialog = WingBuilderDialog(parent)
+    if dialog.exec() != QtWidgets.QDialog.Accepted:
+        return
+
+    opts = dialog.values()
+    if not opts["station_file"]:
+        QtWidgets.QMessageBox.warning(parent, "Wing Builder", "Please select a station file.")
+        return
+    if not os.path.isfile(opts["station_file"]):
+        QtWidgets.QMessageBox.warning(parent, "Wing Builder", f"File not found:\n{opts['station_file']}")
+        return
+
+    try:
+        build_wing(
+            opts["station_file"],
+            ruled=opts["ruled"],
+            solid=opts["solid"],
+            round_tip=opts["round_tip"],
+            round_root=opts["round_root"],
+            fuse_solids=opts["fuse_solids"],
+            ignore_volume_check=opts["ignore_volume_check"],
+            show_profiles=opts["show_profiles"],
+        )
+    except Exception as e:
+        QtWidgets.QMessageBox.critical(parent, "Wing Builder", f"Failed to build wing:\n\n{e}")
+        raise
+
+
+run()
