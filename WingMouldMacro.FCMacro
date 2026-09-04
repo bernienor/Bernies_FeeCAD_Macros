@@ -96,6 +96,7 @@ DEFAULT_SETTINGS = {
         "min_dist_z_neg": 20.0,
         "non_rectangular": False,
         "station_csv_path": "",
+        "ruled": True,
     },
     "parting": {
         "span_axis": "Y",
@@ -401,87 +402,138 @@ def station_le_te_local(station):
     return le, te
 
 
-def build_wing_outline_face_from_csv(target, span_index, enclosure_settings, z_base, csv_path):
-    """Build the 4-point trapezoid outline face using root/tip corners read
-    directly from a WingBuilder station CSV, rather than slicing the
+def _build_side_points(span_index, chord_index, station_corners, span_lo, span_hi, z_base, key):
+    """Build the ordered point list for one side ('lo' or 'hi') of the
+    outline: the margin-extended root point, each real station's point in
+    order, and the margin-extended tip point -- skipping an extension
+    point that would exactly duplicate the adjacent real station (a
+    zero-margin edge)."""
+    root = station_corners[0]
+    tip = station_corners[-1]
+    points = []
+
+    ext_pre = make_point(span_index, chord_index, span_lo, root[key], z_base)
+    first_real = make_point(span_index, chord_index, root["y"], root[key], z_base)
+    if not ext_pre.isEqual(first_real, 1e-6):
+        points.append(ext_pre)
+
+    for s in station_corners:
+        points.append(make_point(span_index, chord_index, s["y"], s[key], z_base))
+
+    ext_post = make_point(span_index, chord_index, span_hi, tip[key], z_base)
+    if not ext_post.isEqual(points[-1], 1e-6):
+        points.append(ext_post)
+
+    return points
+
+
+def build_outline_wire(span_index, chord_index, station_corners, span_lo, span_hi, z_base, ruled):
+    """Build the closed outline wire from an ordered list of station
+    corner dicts ({'y','lo','hi'}, margin-expanded, sorted by y), plus the
+    margin-extended span_lo/span_hi root/tip positions.
+
+    ruled=True (matches WingBuilder's own default) connects consecutive
+    stations with straight segments -- correct for a wing built as
+    distinct panels between ribs. ruled=False fits one smooth curve
+    through all stations per side instead, for a wing WingBuilder lofted
+    with a smooth (non-ruled) blend. Either way the root/tip margin
+    extension itself stays part of the same curve/polygon (so with
+    ruled=False it blends smoothly outward too, rather than kinking at
+    the last real station) -- for a 2-station wing this makes no visible
+    difference either way.
+    """
+    lo_points = _build_side_points(span_index, chord_index, station_corners, span_lo, span_hi, z_base, "lo")
+    hi_points = _build_side_points(span_index, chord_index, station_corners, span_lo, span_hi, z_base, "hi")
+
+    if ruled or len(station_corners) < 3:
+        outline_points = lo_points + list(reversed(hi_points))
+        outline_points.append(outline_points[0])
+        return Part.makePolygon(outline_points)
+
+    lo_curve = Part.BSplineCurve()
+    lo_curve.interpolate(lo_points)
+    hi_curve = Part.BSplineCurve()
+    hi_curve.interpolate(list(reversed(hi_points)))
+
+    edges = [
+        lo_curve.toShape(),
+        Part.makeLine(lo_points[-1], hi_points[-1]),
+        hi_curve.toShape(),
+        Part.makeLine(hi_points[0], lo_points[0]),
+    ]
+    return Part.Wire(edges)
+
+
+def build_wing_outline_face_from_csv(target, span_index, enclosure_settings, z_base, csv_path, ruled=True):
+    """Build the outline face using every station read directly from a
+    WingBuilder station CSV (not just root/tip), rather than slicing the
     solid. Pure arithmetic on the CSV's own numbers, so it isn't subject
-    to the fragility of slicing near a thin or curved tip.
+    to the fragility of slicing near a thin or curved tip -- and unlike
+    the 2-point trapezoid, this follows any intermediate bulge/waist a
+    multi-station planform has (e.g. a rounded stabilizer), matching
+    ruled/smooth to however WingBuilder actually lofted it.
 
     Note: WingBuilder's rounded tip cap is deliberately extra geometry
-    added beyond these station positions, by its own design -- so this
+    added beyond the outermost station, by its own design -- so this
     still gives the pre-cap corners, not a cap-aware outline. The tip-
-    side margin still needs to cover the cap, same as before; this just
-    makes the corners themselves reliable.
+    side margin still needs to cover the cap, same as before.
     """
     stations = read_station_csv(csv_path)
-    root = stations[0]
-    tip = stations[-1]
 
-    for station, label in ((root, "root"), (tip, "tip")):
+    for i, station in enumerate(stations):
         if abs(station.get("bend_deg", 0.0)) > 0.5:
             App.Console.PrintWarning(
-                "Wing mould: {} station has bend_deg={:.1f} -- CSV-based "
-                "corner extraction doesn't account for bent (winglet) "
-                "stations and may be inaccurate there.\n".format(label, station["bend_deg"])
+                "Wing mould: station {} (y={:.1f}) has bend_deg={:.1f} -- "
+                "CSV-based outline extraction doesn't account for bent "
+                "(winglet) stations and may be inaccurate there.\n".format(
+                    i, station["y_position"], station["bend_deg"]
+                )
             )
-
-    root_le_local, root_te_local = station_le_te_local(root)
-    tip_le_local, tip_te_local = station_le_te_local(tip)
-
-    placement = target.Placement
-    root_le = placement.multVec(root_le_local)
-    root_te = placement.multVec(root_te_local)
-    tip_le = placement.multVec(tip_le_local)
-    tip_te = placement.multVec(tip_te_local)
 
     chord_index = 1 - span_index
     chord_neg, chord_pos = margin_pair_for_axis(chord_index, enclosure_settings)
     span_neg, span_pos = margin_pair_for_axis(span_index, enclosure_settings)
 
-    root_y = vec_component(root_le, span_index)
-    tip_y = vec_component(tip_le, span_index)
-    root_span = root_y - span_neg
-    tip_span = tip_y + span_pos
+    placement = target.Placement
+    station_corners = []
+    for station in stations:
+        le_local, te_local = station_le_te_local(station)
+        le = placement.multVec(le_local)
+        te = placement.multVec(te_local)
+        station_corners.append({
+            "y": vec_component(le, span_index),
+            "lo": vec_component(le, chord_index) - chord_neg,
+            "hi": vec_component(te, chord_index) + chord_pos,
+        })
+    station_corners.sort(key=lambda s: s["y"])
 
-    root_chord_lo = vec_component(root_le, chord_index) - chord_neg
-    root_chord_hi = vec_component(root_te, chord_index) + chord_pos
-    tip_chord_lo = vec_component(tip_le, chord_index) - chord_neg
-    tip_chord_hi = vec_component(tip_te, chord_index) + chord_pos
+    span_lo = station_corners[0]["y"] - span_neg
+    span_hi = station_corners[-1]["y"] + span_pos
 
-    p1 = make_point(span_index, chord_index, root_span, root_chord_lo, z_base)
-    p2 = make_point(span_index, chord_index, root_span, root_chord_hi, z_base)
-    p3 = make_point(span_index, chord_index, tip_span, tip_chord_hi, z_base)
-    p4 = make_point(span_index, chord_index, tip_span, tip_chord_lo, z_base)
-
-    wire = Part.makePolygon([p1, p2, p3, p4, p1])
+    wire = build_outline_wire(span_index, chord_index, station_corners, span_lo, span_hi, z_base, ruled)
     face = Part.Face(wire)
 
-    corner_data = {
-        "root_y": root_y,
-        "tip_y": tip_y,
-        "root_lo": root_chord_lo,
-        "root_hi": root_chord_hi,
-        "tip_lo": tip_chord_lo,
-        "tip_hi": tip_chord_hi,
-    }
+    corner_data = {"stations": station_corners}
     return face, corner_data
 
 
 def build_wing_outline_face(shape, span_index, enclosure_settings, z_base):
-    """Build a simple 4-point (trapezoidal) outline face at Z=z_base, from
-    just the wing's root and tip cross-sections, expanded by the
-    chordwise enclosure margins (X+/X- or Y+/Y-, whichever axis is
-    chordwise) and extended past root/tip by the spanwise margins.
+    """Build the fallback 2-station (root/tip only) trapezoid outline face
+    by slicing the solid directly -- used when no station CSV is set or
+    usable. This deliberately does not trace every station along the
+    span: tracing many stations via slicing followed the wing closely
+    everywhere, but cross-sections shrinking down near the tip could
+    produce a visible artifact there (a small jog/notch) once the end-cap
+    was stitched on. A straight-edge trapezoid through root and tip only
+    is exact for a linearly-tapered (and/or swept) 2-station panel, and
+    far more robust.
 
-    This deliberately does not trace every station along the span --
-    tracing many stations followed the wing closely everywhere, but the
-    cross-sections shrinking down near the tip could produce a visible
-    artifact there (a small jog/notch) once the end-cap was stitched on.
-    A straight-edge trapezoid through root and tip only is exact for a
-    linearly-tapered (and/or swept) panel, and far more robust. It is
-    only an approximation for a wing with a curved planform, local kinks,
-    or an irregular tip -- for those, widen the enclosure margins so the
-    straight edges still fully enclose the actual surface.
+    It is only an approximation for a wing with more shape than a
+    straight taper (a curved/waisted planform like a rounded stabilizer,
+    local kinks, or an irregular tip) -- for those, prefer the CSV-based
+    method (build_wing_outline_face_from_csv), which can follow
+    intermediate stations exactly; failing that, widen the enclosure
+    margins so the straight edges still fully enclose the actual surface.
     """
     chord_index = 1 - span_index
     stations, _ = compute_parting_stations(shape, span_index, 2)
@@ -494,30 +546,26 @@ def build_wing_outline_face(shape, span_index, enclosure_settings, z_base):
     root_span, root_min, root_max = stations[0]
     tip_span, tip_min, tip_max = stations[-1]
 
+    station_corners = [
+        {
+            "y": root_span,
+            "lo": vec_component(root_min, chord_index) - chord_neg,
+            "hi": vec_component(root_max, chord_index) + chord_pos,
+        },
+        {
+            "y": tip_span,
+            "lo": vec_component(tip_min, chord_index) - chord_neg,
+            "hi": vec_component(tip_max, chord_index) + chord_pos,
+        },
+    ]
+
     span_lo = root_span - span_neg
     span_hi = tip_span + span_pos
 
-    root_chord_lo = vec_component(root_min, chord_index) - chord_neg
-    root_chord_hi = vec_component(root_max, chord_index) + chord_pos
-    tip_chord_lo = vec_component(tip_min, chord_index) - chord_neg
-    tip_chord_hi = vec_component(tip_max, chord_index) + chord_pos
-
-    p1 = make_point(span_index, chord_index, span_lo, root_chord_lo, z_base)
-    p2 = make_point(span_index, chord_index, span_lo, root_chord_hi, z_base)
-    p3 = make_point(span_index, chord_index, span_hi, tip_chord_hi, z_base)
-    p4 = make_point(span_index, chord_index, span_hi, tip_chord_lo, z_base)
-
-    wire = Part.makePolygon([p1, p2, p3, p4, p1])
+    wire = build_outline_wire(span_index, chord_index, station_corners, span_lo, span_hi, z_base, True)
     face = Part.Face(wire)
 
-    corner_data = {
-        "root_y": root_span,
-        "tip_y": tip_span,
-        "root_lo": root_chord_lo,
-        "root_hi": root_chord_hi,
-        "tip_lo": tip_chord_lo,
-        "tip_hi": tip_chord_hi,
-    }
+    corner_data = {"stations": station_corners}
     return face, corner_data
 
 
@@ -530,9 +578,10 @@ def compute_enclosure_shape(shape, enclosure_settings, parting_settings, target=
     itself. Returns (shape, bounds, corner_data): bounds is always the
     overall (xmin, xmax, ymin, ymax, zmin, zmax) axis-aligned box, used
     elsewhere (holes, flat parting plane) regardless of enclosure shape;
-    corner_data is the root/tip span/chord corner dict used to build the
-    trapezoid (None in rectangular mode), reused by separation tabs so
-    their edge placement always matches whichever wall is actually there.
+    corner_data is {'stations': [...]} -- the ordered list of margin-
+    expanded station corners used to build the outline (None in
+    rectangular mode) -- reused by separation tabs so their edge
+    placement always matches whichever wall is actually there.
     """
     bounds = compute_enclosure_bounds(shape, enclosure_settings)
 
@@ -565,12 +614,15 @@ def compute_enclosure_shape(shape, enclosure_settings, parting_settings, target=
             )
         else:
             try:
+                ruled = bool(enclosure_settings.get("ruled", True))
                 outline_face, corner_data = build_wing_outline_face_from_csv(
-                    target, span_index, enclosure_settings, zmin, csv_path
+                    target, span_index, enclosure_settings, zmin, csv_path, ruled
                 )
                 App.Console.PrintMessage(
                     "Wing mould: non-rectangular outline built from station "
-                    "CSV '{}'\n".format(csv_path)
+                    "CSV '{}' ({} stations, {})\n".format(
+                        csv_path, len(corner_data["stations"]), "ruled" if ruled else "smooth"
+                    )
                 )
             except Exception as e:
                 App.Console.PrintWarning(
@@ -635,9 +687,13 @@ def build_tabs_cutter(shape, bounds, enclosure_settings, parting_settings, tabs_
 
     Works in either enclosure mode: for the rectangular case, both edges
     are just the constant xmin/xmax (or ymin/ymax); for the non-rectangular
-    case, edge position is linearly interpolated between the same root/tip
-    corner_data used to build the trapezoid outline itself, so tabs always
-    line up with whichever wall is actually there.
+    case, edge position is linearly interpolated between whichever pair of
+    real stations bracket a given tab's span position (same corner_data
+    used to build the outline itself, so tabs always line up with
+    whichever wall is actually there) -- always piecewise-linear between
+    the two nearest real stations, regardless of whether the outline
+    itself is ruled or smooth; a spline lookup at an arbitrary Y is more
+    machinery than a few-mm feature justifies.
     """
     count = int(tabs_settings.get("count", 0))
     if count <= 0:
@@ -662,14 +718,20 @@ def build_tabs_cutter(shape, bounds, enclosure_settings, parting_settings, tabs_
 
     def edge_at(y, side):
         if non_rect:
-            root_y = corner_data["root_y"]
-            tip_y = corner_data["tip_y"]
-            root_val = corner_data["root_lo"] if side == "lo" else corner_data["root_hi"]
-            tip_val = corner_data["tip_lo"] if side == "lo" else corner_data["tip_hi"]
-            if tip_y == root_y:
-                return root_val
-            t = (y - root_y) / (tip_y - root_y)
-            return root_val + t * (tip_val - root_val)
+            stations = corner_data["stations"]
+            key = "lo" if side == "lo" else "hi"
+            if y <= stations[0]["y"]:
+                return stations[0][key]
+            if y >= stations[-1]["y"]:
+                return stations[-1][key]
+            for i in range(len(stations) - 1):
+                y0, y1 = stations[i]["y"], stations[i + 1]["y"]
+                if y0 <= y <= y1:
+                    if y1 == y0:
+                        return stations[i][key]
+                    t = (y - y0) / (y1 - y0)
+                    return stations[i][key] + t * (stations[i + 1][key] - stations[i][key])
+            return stations[-1][key]
         return chord_lo_const if side == "lo" else chord_hi_const
 
     chord_neg, chord_pos = margin_pair_for_axis(chord_index, enclosure_settings)
@@ -1116,6 +1178,19 @@ class WingMouldDialog(QtWidgets.QDialog):
         enc_form.addRow("Station CSV", station_row)
         self.station_csv_browse_btn.clicked.connect(self.on_browse_station_csv)
 
+        self.ruled_checkbox = QtWidgets.QCheckBox("Ruled wing form")
+        self.ruled_checkbox.setChecked(bool(enclosure_values.get("ruled", True)))
+        self.ruled_checkbox.setToolTip(
+            "Matches WingBuilder's own Ruled option. Checked (default): "
+            "straight-line panels between consecutive CSV stations -- "
+            "correct if the wing was lofted ruled=True (straight panels "
+            "between ribs). Unchecked: one smooth curve through all "
+            "stations per edge instead, for a wing lofted ruled=False. "
+            "Only affects the CSV-based outline (2-station fallback "
+            "can't tell the difference)."
+        )
+        enc_form.addRow(self.ruled_checkbox)
+
         enc_group.setLayout(enc_form)
         layout.addWidget(enc_group)
 
@@ -1296,6 +1371,7 @@ class WingMouldDialog(QtWidgets.QDialog):
         settings = {key: spin.value() for key, spin in self.spinboxes.items()}
         settings["non_rectangular"] = self.non_rect_checkbox.isChecked()
         settings["station_csv_path"] = self.station_csv_edit.text().strip()
+        settings["ruled"] = self.ruled_checkbox.isChecked()
         return settings
 
     def on_browse_station_csv(self):
@@ -1328,6 +1404,8 @@ class WingMouldDialog(QtWidgets.QDialog):
             self.non_rect_checkbox.setChecked(bool(settings["enclosure"]["non_rectangular"]))
         if "station_csv_path" in settings["enclosure"]:
             self.station_csv_edit.setText(settings["enclosure"]["station_csv_path"])
+        if "ruled" in settings["enclosure"]:
+            self.ruled_checkbox.setChecked(bool(settings["enclosure"]["ruled"]))
         parting = settings.get("parting", {})
         if parting.get("span_axis") in PARTING_AXIS_OPTIONS:
             self.span_axis_combo.setCurrentText(parting["span_axis"])
