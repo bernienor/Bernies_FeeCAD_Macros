@@ -402,27 +402,46 @@ def station_le_te_local(station):
     return le, te
 
 
+def _extrapolate_value(y0, v0, y1, v1, y_query):
+    """Linearly extrapolate (or interpolate) the value at y_query along
+    the line through (y0, v0) and (y1, v1)."""
+    if y1 == y0:
+        return v0
+    t = (y_query - y0) / (y1 - y0)
+    return v0 + t * (v1 - v0)
+
+
 def _build_side_points(span_index, chord_index, station_corners, span_lo, span_hi, z_base, key):
     """Build the ordered point list for one side ('lo' or 'hi') of the
-    outline: the margin-extended root point, each real station's point in
-    order, and the margin-extended tip point -- skipping an extension
-    point that would exactly duplicate the adjacent real station (a
-    zero-margin edge)."""
-    root = station_corners[0]
-    tip = station_corners[-1]
-    points = []
+    outline. The root and tip stations themselves are NOT used directly
+    at the ends -- instead, the outermost real panel's own line (the
+    segment between the two outermost stations on that side) is
+    extrapolated out to span_lo/span_hi, and that extrapolated point
+    replaces the real root/tip station entirely.
 
-    ext_pre = make_point(span_index, chord_index, span_lo, root[key], z_base)
-    first_real = make_point(span_index, chord_index, root["y"], root[key], z_base)
-    if not ext_pre.isEqual(first_real, 1e-6):
-        points.append(ext_pre)
+    This continues each outermost panel's own slope all the way to the
+    margin edge, rather than snapping to a flat/perpendicular cut there.
+    For a 2-station wing with sweep (a straight but non-perpendicular LE),
+    this changes the root/tip edges from a flat cut to one angled along
+    that sweep -- it only coincides with the old flat behavior for a wing
+    with literally zero sweep (leading edge at a constant chordwise
+    position along the whole span).
+    """
+    if len(station_corners) < 2:
+        raise RuntimeError("Need at least 2 stations to build an outline side.")
 
-    for s in station_corners:
+    y0, v0 = station_corners[0]["y"], station_corners[0][key]
+    y1, v1 = station_corners[1]["y"], station_corners[1][key]
+    lo_extrap = _extrapolate_value(y0, v0, y1, v1, span_lo)
+
+    yN0, vN0 = station_corners[-2]["y"], station_corners[-2][key]
+    yN1, vN1 = station_corners[-1]["y"], station_corners[-1][key]
+    hi_extrap = _extrapolate_value(yN0, vN0, yN1, vN1, span_hi)
+
+    points = [make_point(span_index, chord_index, span_lo, lo_extrap, z_base)]
+    for s in station_corners[1:-1]:
         points.append(make_point(span_index, chord_index, s["y"], s[key], z_base))
-
-    ext_post = make_point(span_index, chord_index, span_hi, tip[key], z_base)
-    if not ext_post.isEqual(points[-1], 1e-6):
-        points.append(ext_post)
+    points.append(make_point(span_index, chord_index, span_hi, hi_extrap, z_base))
 
     return points
 
@@ -436,11 +455,11 @@ def build_outline_wire(span_index, chord_index, station_corners, span_lo, span_h
     stations with straight segments -- correct for a wing built as
     distinct panels between ribs. ruled=False fits one smooth curve
     through all stations per side instead, for a wing WingBuilder lofted
-    with a smooth (non-ruled) blend. Either way the root/tip margin
-    extension itself stays part of the same curve/polygon (so with
-    ruled=False it blends smoothly outward too, rather than kinking at
-    the last real station) -- for a 2-station wing this makes no visible
-    difference either way.
+    with a smooth (non-ruled) blend. Either way, the root/tip ends are
+    extrapolated continuations of the outermost real panel's own slope
+    (see _build_side_points), not a flat perpendicular cut -- so a swept
+    wing's mould edges will angle to match that sweep, even with just 2
+    stations. Only a wing with zero sweep sees the old flat behavior.
     """
     lo_points = _build_side_points(span_index, chord_index, station_corners, span_lo, span_hi, z_base, "lo")
     hi_points = _build_side_points(span_index, chord_index, station_corners, span_lo, span_hi, z_base, "hi")
@@ -1026,7 +1045,7 @@ def split_mould_blank(mould_blank_shape, knife_solid):
 
     if not top_solids or not bottom_solids:
         raise RuntimeError(
-            "Split produced an empty top or bottom half -- the parting "
+           "Split produced an empty top or bottom half -- the parting "
             "surface may not fully cross the mould blank. Check the span "
             "axis setting and MouldPartingSurface's position."
         )
