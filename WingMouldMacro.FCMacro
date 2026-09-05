@@ -118,6 +118,10 @@ DEFAULT_SETTINGS = {
         "height": 2.0,
         "count": 0,
     },
+    "te_extension": {
+        "enabled": False,
+        "thickness": 0.5,
+    },
 }
 
 ENCLOSURE_FIELDS = [
@@ -853,16 +857,99 @@ def build_tabs_cutter(shape, blank_shape, parting_settings, tabs_settings, parti
     return combine_shapes(cutters)
 
 
-def build_mould_blank(enclosure_settings, holes_settings=None, parting_settings=None, tabs_settings=None):
+def get_real_station_span(shape, span_index, enclosure_settings, target):
+    """Return (span_min, span_max) for the wing's REAL, CSV-defined
+    stations only -- excluding any rounded tip/root cap WingBuilder may
+    have added beyond them (that cap is deliberately extra geometry past
+    the last station, by WingBuilder's own design -- see station_le_te_local).
+    Falls back to the wing solid's own bounding box (which DOES include
+    any such cap) if no usable station CSV is configured; there's no
+    reliable way to find that boundary from geometry alone."""
+    csv_path = (enclosure_settings.get("station_csv_path") or "").strip()
+    if csv_path and os.path.isfile(csv_path) and target is not None:
+        try:
+            stations = read_station_csv(csv_path)
+            placement = target.Placement
+            le_first, _ = station_le_te_local(stations[0])
+            le_last, _ = station_le_te_local(stations[-1])
+            y_first = vec_component(placement.multVec(le_first), span_index)
+            y_last = vec_component(placement.multVec(le_last), span_index)
+            return min(y_first, y_last), max(y_first, y_last)
+        except Exception as e:
+            App.Console.PrintWarning(
+                "Wing mould: could not use station CSV for the real span "
+                "range ({}) -- falling back to the wing's own bounding "
+                "box, which may include a rounded tip/root cap.\n".format(e)
+            )
+    return get_span_bounds(shape, span_index)
+
+
+def build_te_gap_cutter(wing_shape, blank_shape, span_index, num_sections, thickness, parting_z, span_override=None):
+    """Build the trailing-edge gap cutter: a thin continuous strip running
+    the real span (root to tip, or span_override if given -- see
+    get_real_station_span), connecting the wing's own TE surface to the
+    mould's actual outer wall on the TE side, centered on the parting Z.
+    Lets overlength fibreglass/kevlar/carbon poke through at the parting
+    line instead of being crushed right at the TE, to be trimmed off
+    after cure.
+
+    Built the same way as the separation tabs -- by slicing the real
+    wing and the real built blank directly, not the enclosure's outline
+    model -- so it's correct regardless of rectangular/non-rectangular
+    enclosure or ruled/smooth outline mode. TE is assumed to be the
+    'hi' (larger chordwise value) side, consistent with every wing this
+    macro has handled so far (LE at x_offset, TE at x_offset + chord).
+    """
+    chord_index = 1 - span_index
+    stations, _ = compute_parting_stations(wing_shape, span_index, num_sections, span_override)
+    if len(stations) < 2:
+        raise RuntimeError("Not enough valid cross-sections to build the TE gap.")
+
+    protrude = 2.0  # extend past both the wing's TE and the mould's outer wall for a clean breach
+    z_lo = parting_z - thickness / 2.0
+    z_hi = parting_z + thickness / 2.0
+
+    wires = []
+    for y, _pt_min, pt_max in stations:
+        wing_te_x = vec_component(pt_max, chord_index)
+
+        outer_pt = find_outer_wall_point(blank_shape, span_index, chord_index, y, "hi")
+        if outer_pt is None:
+            raise RuntimeError(
+                "Could not find the mould's outer wall at span {:.2f} for the TE gap.".format(y)
+            )
+        outer_x = vec_component(outer_pt, chord_index)
+
+        chord_in = wing_te_x - protrude
+        chord_out = outer_x + protrude
+
+        p1 = make_point(span_index, chord_index, y, chord_in, z_lo)
+        p2 = make_point(span_index, chord_index, y, chord_out, z_lo)
+        p3 = make_point(span_index, chord_index, y, chord_out, z_hi)
+        p4 = make_point(span_index, chord_index, y, chord_in, z_hi)
+        wires.append(Part.makePolygon([p1, p2, p3, p4, p1]))
+
+    return Part.makeLoft(wires, True, True)  # solid=True, ruled=True
+
+
+def build_mould_blank(enclosure_settings, holes_settings=None, parting_settings=None, tabs_settings=None,
+                      te_extension_settings=None):
     """Build (or rebuild) the mould blank object using the given enclosure
     settings dict (keys as in DEFAULT_SETTINGS['enclosure']), then cut any
-    alignment holes (list of {'x','y','diameter'} dicts) and separation
-    tabs out of it too.
+    alignment holes (list of {'x','y','diameter'} dicts), separation
+    tabs, and a trailing-edge gap out of it too.
 
     parting_settings is required whenever enclosure_settings['non_rectangular']
-    is set (supplies the span axis used to find the wing's root and tip)
-    and whenever tabs_settings['count'] > 0 (supplies the span axis for
-    tab spacing, and the parting Z for tab centering)."""
+    is set (supplies the span axis used to find the wing's root and tip),
+    whenever tabs_settings['count'] > 0 (span axis for tab spacing, parting
+    Z for tab centering), and whenever te_extension_settings['enabled'] is
+    set (span axis, section count, and parting Z for the TE gap).
+
+    Tabs and the TE gap are both computed from the SAME snapshot of the
+    blank (taken right after the wing and holes are cut, before either
+    feature cuts anything) -- so neither one's wall-finding is confused
+    by a notch the other one already cut nearby (both are centered on the
+    same parting Z, so their cuts can sit close together)."""
     doc = App.ActiveDocument
     if doc is None:
         raise RuntimeError("No active FreeCAD document.")
@@ -887,6 +974,10 @@ def build_mould_blank(enclosure_settings, holes_settings=None, parting_settings=
             except Exception as e:
                 raise RuntimeError("Failed to cut alignment holes: {}".format(e))
 
+    # Snapshot here, before tabs/TE-gap -- both features slice this same
+    # unmodified shape to find real wall positions.
+    baseline_blank_shape = mould_blank_shape
+
     if tabs_settings and int(tabs_settings.get("count", 0)) > 0:
         if parting_settings is None:
             raise RuntimeError(
@@ -895,7 +986,7 @@ def build_mould_blank(enclosure_settings, holes_settings=None, parting_settings=
             )
         parting_z = compute_flat_plane_z(shape, parting_settings)
         try:
-            tabs_cutter = build_tabs_cutter(shape, mould_blank_shape, parting_settings, tabs_settings, parting_z)
+            tabs_cutter = build_tabs_cutter(shape, baseline_blank_shape, parting_settings, tabs_settings, parting_z)
         except Exception as e:
             raise RuntimeError("Failed to build separation tabs: {}".format(e))
         if tabs_cutter is not None:
@@ -903,6 +994,28 @@ def build_mould_blank(enclosure_settings, holes_settings=None, parting_settings=
                 mould_blank_shape = mould_blank_shape.cut(tabs_cutter)
             except Exception as e:
                 raise RuntimeError("Failed to cut separation tabs: {}".format(e))
+
+    if te_extension_settings and bool(te_extension_settings.get("enabled", False)):
+        if parting_settings is None:
+            raise RuntimeError(
+                "The TE gap needs the Parting line settings (span axis, "
+                "sections), but none were supplied."
+            )
+        thickness = float(te_extension_settings.get("thickness", 0.5))
+        parting_z = compute_flat_plane_z(shape, parting_settings)
+        span_index = AXIS_INDEX[parting_settings["span_axis"]]
+        num_sections = int(parting_settings.get("num_sections", 80))
+        real_span = get_real_station_span(shape, span_index, enclosure_settings, target)
+        try:
+            te_gap_cutter = build_te_gap_cutter(
+                shape, baseline_blank_shape, span_index, num_sections, thickness, parting_z, real_span
+            )
+        except Exception as e:
+            raise RuntimeError("Failed to build the TE gap: {}".format(e))
+        try:
+            mould_blank_shape = mould_blank_shape.cut(te_gap_cutter)
+        except Exception as e:
+            raise RuntimeError("Failed to cut the TE gap: {}".format(e))
 
     name = OUTPUT_PREFIX + "Blank"
     existing = doc.getObject(name)
@@ -926,11 +1039,17 @@ def get_span_bounds(shape, span_index):
     return (bb.XMin, bb.XMax) if span_index == 0 else (bb.YMin, bb.YMax)
 
 
-def compute_parting_stations(shape, span_index, num_sections):
+def compute_parting_stations(shape, span_index, num_sections, span_override=None):
     """Sample the wing solid at a series of span stations. At each station,
     slice the solid and find the two points on the resulting outline that
     are extremal along the chordwise axis -- the natural parting points
     for a vertical (Z) pull direction.
+
+    If span_override is given (a (span_min, span_max) tuple), stations
+    are sampled across that range instead of the wing solid's own
+    bounding box along the span axis -- used by the TE gap feature to
+    stay within the real, CSV-defined station range and exclude any
+    rounded tip/root cap WingBuilder added beyond it.
 
     Returns (stations, chord_index) where stations is a list of
     (span_value, point_min_chord, point_max_chord).
@@ -942,7 +1061,10 @@ def compute_parting_stations(shape, span_index, num_sections):
         )
 
     chord_index = 1 - span_index  # the other of X(0)/Y(1)
-    span_min, span_max = get_span_bounds(shape, span_index)
+    if span_override is not None:
+        span_min, span_max = span_override
+    else:
+        span_min, span_max = get_span_bounds(shape, span_index)
     span_range = span_max - span_min
     if span_range <= 0:
         raise RuntimeError("Wing solid has zero extent along the span axis.")
@@ -1227,10 +1349,11 @@ class WingMouldDialog(QtWidgets.QDialog):
 
         settings = load_settings(self.current_path)
         self._build_ui(
-            settings["enclosure"], settings["parting"], settings.get("holes", []), settings.get("tabs", {})
+            settings["enclosure"], settings["parting"], settings.get("holes", []), settings.get("tabs", {}),
+            settings.get("te_extension", {}),
         )
 
-    def _build_ui(self, enclosure_values, parting_values, holes_values, tabs_values):
+    def _build_ui(self, enclosure_values, parting_values, holes_values, tabs_values, te_extension_values):
         layout = QtWidgets.QVBoxLayout(self)
 
         enc_group = QtWidgets.QGroupBox("Enclosure extension from bounding box (mm)")
@@ -1383,6 +1506,34 @@ class WingMouldDialog(QtWidgets.QDialog):
         tabs_group.setLayout(tabs_form)
         layout.addWidget(tabs_group)
 
+        te_group = QtWidgets.QGroupBox("Trailing edge gap (fibre/epoxy overflow)")
+        te_form = QtWidgets.QFormLayout()
+
+        self.te_enabled_checkbox = QtWidgets.QCheckBox("Extend TE out of the mould")
+        self.te_enabled_checkbox.setChecked(bool(te_extension_values.get("enabled", False)))
+        self.te_enabled_checkbox.setToolTip(
+            "Cuts a thin slot along the whole trailing edge, connecting the "
+            "cavity to the outside of the mould, centered on the parting "
+            "line. Lets overlength fibre/epoxy poke through instead of "
+            "being crushed at the TE -- trim off the excess after cure."
+        )
+        te_form.addRow(self.te_enabled_checkbox)
+
+        self.te_thickness_spin = QtWidgets.QDoubleSpinBox()
+        self.te_thickness_spin.setRange(0.05, 50.0)
+        self.te_thickness_spin.setDecimals(2)
+        self.te_thickness_spin.setSuffix(" mm")
+        self.te_thickness_spin.setValue(float(te_extension_values.get("thickness", 0.5)))
+        te_form.addRow("Gap thickness", self.te_thickness_spin)
+
+        te_group.setLayout(te_form)
+        layout.addWidget(te_group)
+
+        self.te_enabled_checkbox.stateChanged.connect(
+            lambda _: self.te_thickness_spin.setEnabled(self.te_enabled_checkbox.isChecked())
+        )
+        self.te_thickness_spin.setEnabled(self.te_enabled_checkbox.isChecked())
+
         self.path_label = QtWidgets.QLabel("Settings file: {}".format(self.current_path))
         self.path_label.setWordWrap(True)
         layout.addWidget(self.path_label)
@@ -1446,6 +1597,12 @@ class WingMouldDialog(QtWidgets.QDialog):
             "depth": self.tabs_depth_spin.value(),
             "height": self.tabs_height_spin.value(),
             "count": self.tabs_count_spin.value(),
+        }
+
+    def _current_te_extension_settings(self):
+        return {
+            "enabled": self.te_enabled_checkbox.isChecked(),
+            "thickness": self.te_thickness_spin.value(),
         }
 
     def _update_parting_enabled(self):
@@ -1517,6 +1674,12 @@ class WingMouldDialog(QtWidgets.QDialog):
             self.tabs_height_spin.setValue(float(tabs["height"]))
         if "count" in tabs:
             self.tabs_count_spin.setValue(int(tabs["count"]))
+        te_extension = settings.get("te_extension", {})
+        if "enabled" in te_extension:
+            self.te_enabled_checkbox.setChecked(bool(te_extension["enabled"]))
+        if "thickness" in te_extension:
+            self.te_thickness_spin.setValue(float(te_extension["thickness"]))
+        self.te_thickness_spin.setEnabled(self.te_enabled_checkbox.isChecked())
         self.current_path = path
         self.path_label.setText("Settings file: {}".format(path))
         self.status_label.setText("Loaded settings from {}".format(path))
@@ -1532,6 +1695,7 @@ class WingMouldDialog(QtWidgets.QDialog):
             "parting": self._current_parting_settings(),
             "holes": self._current_holes_settings(),
             "tabs": self._current_tabs_settings(),
+            "te_extension": self._current_te_extension_settings(),
         }
         try:
             save_settings(settings, path)
@@ -1573,8 +1737,11 @@ class WingMouldDialog(QtWidgets.QDialog):
         holes_settings = self._current_holes_settings()
         parting_settings = self._current_parting_settings()
         tabs_settings = self._current_tabs_settings()
+        te_extension_settings = self._current_te_extension_settings()
         try:
-            mould_blank = build_mould_blank(enclosure_settings, holes_settings, parting_settings, tabs_settings)
+            mould_blank = build_mould_blank(
+                enclosure_settings, holes_settings, parting_settings, tabs_settings, te_extension_settings
+            )
         except Exception as e:
             self.status_label.setText("Error: {}".format(e))
             App.Console.PrintError("Wing mould: {}\n".format(e))
