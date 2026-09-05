@@ -701,7 +701,90 @@ def compute_flat_plane_z(wing_shape, parting_settings):
     return float(parting_settings.get("flat_plane_z", 0.0))
 
 
-def build_tabs_cutter(shape, bounds, enclosure_settings, parting_settings, tabs_settings, corner_data, parting_z):
+def find_outer_wall_point(blank_shape, span_index, chord_index, y, side):
+    """Slice the blank at span position y and return the point on the
+    OUTER wall (the boundary with the larger chordwise extent -- the wing
+    cavity, if the slice crosses it, is a smaller interior wire) that is
+    extremal along the chord axis: the minimum-chord point for side='lo',
+    maximum-chord for side='hi'. Returns None if the slice found nothing
+    usable."""
+    try:
+        wires = blank_shape.slice(axis_vector(span_index), y)
+    except Exception:
+        return None
+    if not wires:
+        return None
+
+    def chord_extent(w):
+        bb = w.BoundBox
+        return (bb.XMax - bb.XMin) if chord_index == 0 else (bb.YMax - bb.YMin)
+
+    outer_wire = max(wires, key=chord_extent)
+    points = outer_wire.discretize(Number=STATION_DISCRETIZE_POINTS)
+    if not points:
+        return None
+    key_func = lambda p: vec_component(p, chord_index)
+    return min(points, key=key_func) if side == "lo" else max(points, key=key_func)
+
+
+def find_wall_segment(blank_shape, span_index, chord_index, y_start, y_end, side):
+    """Find the true points on the mould blank's outer wall at the two
+    span positions y_start and y_end (side 'lo' or 'hi') -- the actual
+    boundary points at a tab's own width extents, rather than a single
+    center point plus an estimated tangent. Using the real boundary at
+    both ends guarantees the resulting notch reaches its full nominal
+    width even where the wall kinks or curves within that span, rather
+    than being clipped short by an approximation that only matched the
+    wall near the center."""
+    p_start = find_outer_wall_point(blank_shape, span_index, chord_index, y_start, side)
+    p_end = find_outer_wall_point(blank_shape, span_index, chord_index, y_end, side)
+    if p_start is None or p_end is None:
+        raise RuntimeError(
+            "Could not find the mould wall across span {:.2f} to {:.2f} ({} side).".format(
+                y_start, y_end, side
+            )
+        )
+    return p_start, p_end
+
+
+def find_outward_normal(blank_shape, point, tangent, test_distance=0.5):
+    """Return whichever of the two directions perpendicular to tangent
+    (within the XY plane) points away from the solid, verified with
+    isInside rather than assumed from axis conventions -- so tab cutters
+    always open outward regardless of the local wall angle."""
+    perp = App.Vector(-tangent.y, tangent.x, 0.0)
+    perp.normalize()
+    test_point = point + perp * test_distance
+    if not blank_shape.isInside(test_point, 1e-3, True):
+        return perp
+    return App.Vector(-perp.x, -perp.y, -perp.z)
+
+
+def build_tab_box(p_start, p_end, outward, depth, protrude, z_lo, z_hi):
+    """Build one tab cutter as a box whose outer edge runs exactly between
+    the two true wall points p_start/p_end (the wall boundary at the
+    tab's own width extents), pushed protrude outward and depth inward
+    along `outward`. Because the outer edge's endpoints are real wall
+    points rather than an extrapolation, the notch always reaches its
+    full nominal width against the actual material -- immune to the
+    partial-clip failure mode a center-point tangent estimate could hit
+    near a kink or curve."""
+    p_out_a = p_start + outward * protrude
+    p_out_b = p_end + outward * protrude
+    p_in_a = p_start - outward * depth
+    p_in_b = p_end - outward * depth
+
+    def at_z(pt, z):
+        return App.Vector(pt.x, pt.y, z)
+
+    wire = Part.makePolygon([
+        at_z(p_out_a, z_lo), at_z(p_out_b, z_lo), at_z(p_in_b, z_lo), at_z(p_in_a, z_lo), at_z(p_out_a, z_lo)
+    ])
+    face = Part.Face(wire)
+    return face.extrude(App.Vector(0, 0, z_hi - z_lo))
+
+
+def build_tabs_cutter(shape, blank_shape, parting_settings, tabs_settings, parting_z):
     """Build a fused solid of small box cutters for separation tabs --
     rectangular notches straddling the parting line on both long edges of
     the mould, spaced across the wing's real span (root to tip, not
@@ -710,15 +793,12 @@ def build_tabs_cutter(shape, bounds, enclosure_settings, parting_settings, tabs_
     i.e. tab i (0-indexed) sits at fraction (2i+1)/(2N) of the span. For
     N=2 that's 1/4 and 3/4. Returns None if tabs_settings['count'] is 0.
 
-    Works in either enclosure mode: for the rectangular case, both edges
-    are just the constant xmin/xmax (or ymin/ymax); for the non-rectangular
-    case, edge position is linearly interpolated between whichever pair of
-    real stations bracket a given tab's span position (same corner_data
-    used to build the outline itself, so tabs always line up with
-    whichever wall is actually there) -- always piecewise-linear between
-    the two nearest real stations, regardless of whether the outline
-    itself is ruled or smooth; a spline lookup at an arbitrary Y is more
-    machinery than a few-mm feature justifies.
+    Each tab's outer edge runs between the true wall points at its own
+    width extents (see find_wall_segment), found by slicing the actual
+    built mould blank -- not from the enclosure's outline model -- so
+    tabs always reach their full nominal width against the real wall and
+    open outward, whether the enclosure is rectangular, a straight-edge
+    trapezoid, or a curved (Smooth) multi-station outline.
     """
     count = int(tabs_settings.get("count", 0))
     if count <= 0:
@@ -730,7 +810,6 @@ def build_tabs_cutter(shape, bounds, enclosure_settings, parting_settings, tabs_
 
     span_index = AXIS_INDEX[parting_settings["span_axis"]]
     chord_index = 1 - span_index
-    xmin, xmax, ymin, ymax, zmin, zmax = bounds
 
     real_root, real_tip = get_span_bounds(shape, span_index)
     span_range = real_tip - real_root
@@ -738,55 +817,38 @@ def build_tabs_cutter(shape, bounds, enclosure_settings, parting_settings, tabs_
         raise RuntimeError("Wing solid has zero extent along the span axis.")
     positions = [real_root + span_range * (2 * i + 1) / (2.0 * count) for i in range(count)]
 
-    non_rect = bool(enclosure_settings.get("non_rectangular", False)) and corner_data is not None
-    chord_lo_const, chord_hi_const = (xmin, xmax) if chord_index == 0 else (ymin, ymax)
-
-    def edge_at(y, side):
-        if non_rect:
-            stations = corner_data["stations"]
-            key = "lo" if side == "lo" else "hi"
-            if y <= stations[0]["y"]:
-                return stations[0][key]
-            if y >= stations[-1]["y"]:
-                return stations[-1][key]
-            for i in range(len(stations) - 1):
-                y0, y1 = stations[i]["y"], stations[i + 1]["y"]
-                if y0 <= y <= y1:
-                    if y1 == y0:
-                        return stations[i][key]
-                    t = (y - y0) / (y1 - y0)
-                    return stations[i][key] + t * (stations[i + 1][key] - stations[i][key])
-            return stations[-1][key]
-        return chord_lo_const if side == "lo" else chord_hi_const
-
-    chord_neg, chord_pos = margin_pair_for_axis(chord_index, enclosure_settings)
-    if depth > chord_neg or depth > chord_pos:
-        App.Console.PrintWarning(
-            "Wing mould: separation tab depth ({:.2f} mm) exceeds the "
-            "enclosure margin on at least one edge ({:.2f} / {:.2f} mm) -- "
-            "tabs may cut through into the cavity.\n".format(depth, chord_neg, chord_pos)
-        )
-
-    protrude = 2.0  # extend past the nominal edge for a clean through-cut
+    protrude = 2.0  # extend past the real wall for a clean through-cut
     z_lo = parting_z - height / 2.0
     z_hi = parting_z + height / 2.0
 
     cutters = []
     for y in positions:
-        span_lo = y - width / 2.0
-        span_hi = y + width / 2.0
+        y_start = y - width / 2.0
+        y_end = y + width / 2.0
+        for side in ("lo", "hi"):
+            p_start, p_end = find_wall_segment(blank_shape, span_index, chord_index, y_start, y_end, side)
 
-        lo_edge = edge_at(y, "lo")
-        cutters.append(make_axis_box(
-            span_index, chord_index, span_lo, span_hi,
-            lo_edge - protrude, lo_edge + depth, z_lo, z_hi
-        ))
+            tangent = p_end - p_start
+            if tangent.Length < 1e-9:
+                tangent = axis_vector(span_index)
+            else:
+                tangent.normalize()
 
-        hi_edge = edge_at(y, "hi")
-        cutters.append(make_axis_box(
-            span_index, chord_index, span_lo, span_hi,
-            hi_edge - depth, hi_edge + protrude, z_lo, z_hi
-        ))
+            mid_point = App.Vector(
+                (p_start.x + p_end.x) / 2.0, (p_start.y + p_end.y) / 2.0, (p_start.z + p_end.z) / 2.0
+            )
+            outward = find_outward_normal(blank_shape, mid_point, tangent)
+
+            for label, pt in (("start", p_start), ("end", p_end)):
+                inner_pt = App.Vector(pt.x - outward.x * depth, pt.y - outward.y * depth, parting_z)
+                if not blank_shape.isInside(inner_pt, 1e-3, True):
+                    App.Console.PrintWarning(
+                        "Wing mould: separation tab at span {:.2f} ({} side, {} edge) "
+                        "may cut through into the cavity -- depth ({:.2f} mm) may "
+                        "exceed the actual wall thickness there.\n".format(y, side, label, depth)
+                    )
+
+            cutters.append(build_tab_box(p_start, p_end, outward, depth, protrude, z_lo, z_hi))
 
     return combine_shapes(cutters)
 
@@ -833,9 +895,7 @@ def build_mould_blank(enclosure_settings, holes_settings=None, parting_settings=
             )
         parting_z = compute_flat_plane_z(shape, parting_settings)
         try:
-            tabs_cutter = build_tabs_cutter(
-                shape, bounds, enclosure_settings, parting_settings, tabs_settings, corner_data, parting_z
-            )
+            tabs_cutter = build_tabs_cutter(shape, mould_blank_shape, parting_settings, tabs_settings, parting_z)
         except Exception as e:
             raise RuntimeError("Failed to build separation tabs: {}".format(e))
         if tabs_cutter is not None:
