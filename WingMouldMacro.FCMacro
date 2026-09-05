@@ -86,6 +86,12 @@ TOP_POINT_TESSELLATION_DEVIATION = 0.1
 # its chordwise-extremal points.
 STATION_DISCRETIZE_POINTS = 200
 
+# Safety padding added to the flat parting plane's XY footprint beyond the
+# mould blank's own bounding box, so the cutting tool always clearly
+# exceeds the blank in X/Y rather than merely coinciding with its edge --
+# an exact tangent match is a classic source of unreliable boolean results.
+FLAT_PLANE_XY_MARGIN = 5.0
+
 DEFAULT_SETTINGS = {
     "enclosure": {
         "min_dist_x_pos": 20.0,
@@ -1045,7 +1051,7 @@ def split_mould_blank(mould_blank_shape, knife_solid):
 
     if not top_solids or not bottom_solids:
         raise RuntimeError(
-           "Split produced an empty top or bottom half -- the parting "
+            "Split produced an empty top or bottom half -- the parting "
             "surface may not fully cross the mould blank. Check the span "
             "axis setting and MouldPartingSurface's position."
         )
@@ -1072,7 +1078,11 @@ def build_mould_halves(parting_settings):
     num_sections = int(parting_settings["num_sections"])
 
     bb = blank_obj.Shape.BoundBox
-    enclosure_bounds = (bb.XMin, bb.XMax, bb.YMin, bb.YMax, bb.ZMin, bb.ZMax)
+    enclosure_bounds = (
+        bb.XMin - FLAT_PLANE_XY_MARGIN, bb.XMax + FLAT_PLANE_XY_MARGIN,
+        bb.YMin - FLAT_PLANE_XY_MARGIN, bb.YMax + FLAT_PLANE_XY_MARGIN,
+        bb.ZMin, bb.ZMax,
+    )
 
     use_flat_plane = bool(parting_settings.get("use_flat_plane", True))
 
